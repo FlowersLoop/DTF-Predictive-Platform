@@ -1,604 +1,536 @@
 """
-Limpieza, transformación y feature engineering
-de datos históricos de ventas para modelos de forecasting.
-
-Entrada:  DTF_s_DATA_CORRECT.xlsx (datos crudos de ventas)
-Salidas:  
-  - ventas_limpias.csv          → Datos limpios por transacción
-  - serie_semanal.csv           → Serie de tiempo semanal por categoría
-  - features_modelo.csv         → Dataset listo para entrenar ML
-  - resumen_eda.csv             → Resumen exploratorio por categoría
-  - baseline_naive.csv          → Predicciones del baseline naive
+ETL Pipeline v4.0 — DTF Fashion Predictive Analytics Platform
+Acepta Excel/CSV del usuario, limpia, genera features, escribe a PostgreSQL.
 """
 
-import pandas as pd
-import numpy as np
-import re
-import json
-import warnings
+import os
+import sys
+import logging
+import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
-warnings.filterwarnings('ignore')
+import numpy as np
+import pandas as pd
+from sqlalchemy import text
 
-# ============================================================================
-# CONFIGURACIÓN
-# ============================================================================
-INPUT_FILE = "/mnt/user-data/uploads/DTF_s_DATA_CORRECT.xlsx"
-OUTPUT_DIR = Path("/home/claude/outputs")
-OUTPUT_DIR.mkdir(exist_ok=True)
+# ── Agregar raíz del proyecto al path ──────────────────────────────────────
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from database.connection import engine, read_sql, write_dataframe
 
-PROJECT_START = pd.Timestamp("2025-10-01")
-PROJECT_END = pd.Timestamp("2026-03-16")
-
-# Festividades y eventos relevantes para México + moda DTF
-HOLIDAYS_MX = {
-    "2025-10-31": "halloween",
-    "2025-11-01": "dia_muertos",
-    "2025-11-02": "dia_muertos",
-    "2025-11-15": "buen_fin",
-    "2025-11-16": "buen_fin",
-    "2025-11-17": "buen_fin",
-    "2025-11-28": "black_friday",
-    "2025-12-12": "virgen_guadalupe",
-    "2025-12-24": "nochebuena",
-    "2025-12-25": "navidad",
-    "2025-12-31": "fin_de_ano",
-    "2026-01-01": "ano_nuevo",
-    "2026-02-14": "san_valentin",
-    "2026-03-08": "dia_mujer",
-}
-
-# Mapeo de normalización de estados
-ESTADO_NORMALIZE = {
-    "distrito federal": "CDMX",
-    "cdmx": "CDMX",
-    "ciudad de méxico": "CDMX",
-    "ciudad de mexico": "CDMX",
-    "estado de méxico": "Estado de México",
-    "estado de mexico": "Estado de México",
-    "baja california": "Baja California",
-    "nuevo león": "Nuevo León",
-    "nuevo leon": "Nuevo León",
-    "jalisco": "Jalisco",
-    "puebla": "Puebla",
-    "querétaro": "Querétaro",
-    "queretaro": "Querétaro",
-    "michoacán": "Michoacán",
-    "michoacan": "Michoacán",
-    "veracruz": "Veracruz",
-    "morelos": "Morelos",
-    "colima": "Colima",
-    "aguascalientes": "Aguascalientes",
-    "saltillo": "Coahuila",
-    "monterrey": "Nuevo León",
-    "tijuana": "Baja California",
-    "toronto": "Ontario",
-}
-
-CATEGORIA_NORMALIZE = {
-    "fútbol": "Futbol",
-    "futbol": "Futbol",
-    "tenis": "Tenis",
-    "musica": "Musica",
-    "deportiva": "Deportiva",
-    "movies": "Movies",
-    "sports": "Sports",
-}
-
-# ============================================================================
-# PASO 1: CARGA Y PARSEO DE FECHAS
-# ============================================================================
-print("=" * 70)
-print("PASO 1: Carga de datos y parseo de fechas")
-print("=" * 70)
-
-df_raw = pd.read_excel(INPUT_FILE, header=None)
-
-# Buscar fila de encabezados
-header_row = None
-for i, row in df_raw.iterrows():
-    if any(str(v).strip() == "# de venta" for v in row.values if v is not None):
-        header_row = i
-        break
-
-df = pd.read_excel(INPUT_FILE, header=header_row)
-df = df.dropna(subset=["# de venta"])
-df.columns = df.columns.str.strip()
-
-print(f"  Registros cargados: {len(df)}")
-print(f"  Columnas: {list(df.columns)}")
-
-# Parseo robusto de fechas en español
-MESES_ES = {
-    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
-    "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
-    "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12
-}
-
-def parse_fecha_es(fecha_str):
-    """Parsea fechas en formato '07 de octubre 2025' o '9 de marzo de 2026'."""
-    if pd.isna(fecha_str):
-        return pd.NaT
-    s = str(fecha_str).lower().strip()
-    s = s.replace(" de ", " ").replace("  ", " ")
-    parts = s.split()
-    if len(parts) < 3:
-        return pd.NaT
-    try:
-        dia = int(parts[0])
-        mes = MESES_ES.get(parts[1])
-        anio = int(parts[2])
-        if mes is None:
-            return pd.NaT
-        return pd.Timestamp(anio, mes, dia)
-    except (ValueError, IndexError):
-        return pd.NaT
-
-df["fecha"] = df["Fecha de venta"].apply(parse_fecha_es)
-
-fechas_fallidas = df["fecha"].isna().sum()
-if fechas_fallidas > 0:
-    print(f"  ⚠ Fechas no parseadas: {fechas_fallidas}")
-    print(df[df["fecha"].isna()][["# de venta", "Fecha de venta"]])
-else:
-    print(f"  ✓ Todas las fechas parseadas correctamente")
-
-print(f"  Rango: {df['fecha'].min().strftime('%Y-%m-%d')} → {df['fecha'].max().strftime('%Y-%m-%d')}")
-
-
-# ============================================================================
-# PASO 2: LIMPIEZA Y NORMALIZACIÓN
-# ============================================================================
-print("\n" + "=" * 70)
-print("PASO 2: Limpieza y normalización de campos")
-print("=" * 70)
-
-# Renombrar columnas a snake_case
-df = df.rename(columns={
-    "# de venta": "venta_id",
-    "Estado de venta": "estado_venta",
-    "Ingresos": "ingresos",
-    "Cargo por venta": "cargo_venta",
-    "Costo de envio": "costo_envio",
-    "Total": "total_neto",
-    "Diseño DTF": "diseno",
-    "Estado": "estado_geo",
-    "País": "pais",
-    "Categoria": "categoria",
-    "Tipo de prenda": "tipo_prenda",
-})
-
-# Limpiar ID de venta
-df["venta_id"] = pd.to_numeric(df["venta_id"], errors="coerce").astype("Int64")
-
-# Limpiar campos numéricos
-for col in ["ingresos", "cargo_venta", "costo_envio", "total_neto"]:
-    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).round(2)
-
-# Recalcular total_neto para verificar integridad
-df["total_calculado"] = (df["ingresos"] - df["cargo_venta"] - df["costo_envio"]).round(2)
-discrepancias = (df["total_neto"] - df["total_calculado"]).abs() > 1
-if discrepancias.any():
-    n_disc = discrepancias.sum()
-    print(f"  ⚠ {n_disc} discrepancias en total_neto, recalculando...")
-    df.loc[discrepancias, "total_neto"] = df.loc[discrepancias, "total_calculado"]
-else:
-    print("  ✓ Todos los totales verificados")
-
-df = df.drop(columns=["total_calculado"])
-
-# Normalizar strings
-df["diseno"] = df["diseno"].str.strip()
-df["tipo_prenda"] = df["tipo_prenda"].str.strip().str.title()
-df["pais"] = df["pais"].str.strip().str.title()
-
-# Normalizar estados geográficos
-df["estado_geo_raw"] = df["estado_geo"].str.strip()
-df["estado_geo"] = df["estado_geo_raw"].str.lower().str.strip().map(
-    lambda x: ESTADO_NORMALIZE.get(x, x.title() if isinstance(x, str) else x)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
+log = logging.getLogger("etl_pipeline")
 
-# Normalizar categorías
-df["categoria_raw"] = df["categoria"].str.strip()
-df["categoria"] = df["categoria_raw"].str.lower().str.strip().map(
-    lambda x: CATEGORIA_NORMALIZE.get(x, x.title() if isinstance(x, str) else x)
-)
+# ═══════════════════════════════════════════════════════════════════════════
+# ÍNDICES ESTACIONALES H&M HARDCODEADOS
+# Extraídos de 31.7M transacciones — SARIMA(1,1,1)(1,1,1)[7], MAPE 15.48%
+# ═══════════════════════════════════════════════════════════════════════════
+HM_INDICE_SEMANAL = {
+    0: 0.94,   # Lunes
+    1: 0.89,   # Martes
+    2: 0.91,   # Miércoles
+    3: 0.95,   # Jueves
+    4: 1.05,   # Viernes
+    5: 1.16,   # Sábado  (pico H&M: 48,383 uds promedio)
+    6: 1.10,   # Domingo
+}
 
-# Normalizar país
-df["pais"] = df["pais"].replace({"Cánada": "Canadá", "Canada": "Canadá", "México": "México"})
+HM_INDICE_MENSUAL = {
+    1:  0.92,   # Enero
+    2:  0.90,   # Febrero
+    3:  0.86,   # Marzo
+    4:  0.95,   # Abril
+    5:  1.14,   # Mayo
+    6:  1.41,   # Junio   (pico H&M: 61,000 uds)
+    7:  1.16,   # Julio
+    8:  0.95,   # Agosto
+    9:  1.03,   # Septiembre
+    10: 0.93,   # Octubre
+    11: 0.93,   # Noviembre
+    12: 0.84,   # Diciembre (mínimo H&M: 36,500 uds)
+}
 
-# Marcar si es venta internacional
-df["es_internacional"] = (df["pais"] != "México").astype(int)
-
-print(f"  ✓ {df['categoria'].nunique()} categorías: {sorted(df['categoria'].unique())}")
-print(f"  ✓ {df['tipo_prenda'].nunique()} tipos: {sorted(df['tipo_prenda'].unique())}")
-print(f"  ✓ {df['estado_geo'].nunique()} estados: {sorted(df['estado_geo'].unique())}")
-print(f"  ✓ {df['diseno'].nunique()} diseños únicos")
-
-
-# ============================================================================
-# PASO 3: FEATURE ENGINEERING — VARIABLES TEMPORALES
-# ============================================================================
-print("\n" + "=" * 70)
-print("PASO 3: Feature engineering — variables temporales")
-print("=" * 70)
-
-df["anio"] = df["fecha"].dt.year
-df["mes"] = df["fecha"].dt.month
-df["semana_iso"] = df["fecha"].dt.isocalendar().week.astype(int)
-df["dia_semana"] = df["fecha"].dt.dayofweek  # 0=lunes, 6=domingo
-df["dia_mes"] = df["fecha"].dt.day
-df["semana_del_anio"] = df["fecha"].dt.isocalendar().week.astype(int)
-
-# Etiqueta año-semana para agrupación temporal
-df["anio_semana"] = df["fecha"].dt.strftime("%G-W%V")
-
-# Flags de calendario (relevantes para moda en México)
-df["es_quincena"] = df["dia_mes"].isin([14, 15, 16, 29, 30, 31]).astype(int)
-df["es_fin_de_semana"] = (df["dia_semana"] >= 5).astype(int)
-df["es_inicio_mes"] = (df["dia_mes"] <= 5).astype(int)
-
-# Temporadas de moda/consumo
-def get_temporada(fecha):
-    m = fecha.month
-    if m in [12, 1, 2]: return "invierno"
-    if m in [3, 4, 5]: return "primavera"
-    if m in [6, 7, 8]: return "verano"
-    return "otono"
-
-df["temporada"] = df["fecha"].apply(get_temporada)
-
-# Flags de eventos específicos
-def get_evento_cercano(fecha, ventana_dias=7):
-    """Verifica si hay un evento relevante dentro de la ventana."""
-    for fecha_ev, nombre_ev in HOLIDAYS_MX.items():
-        ev = pd.Timestamp(fecha_ev)
-        if abs((fecha - ev).days) <= ventana_dias:
-            return nombre_ev
-    return "ninguno"
-
-df["evento_cercano"] = df["fecha"].apply(get_evento_cercano)
-df["tiene_evento"] = (df["evento_cercano"] != "ninguno").astype(int)
-
-# Semanas desde el inicio del negocio (para capturar tendencia de crecimiento)
-df["semanas_desde_inicio"] = ((df["fecha"] - df["fecha"].min()).dt.days / 7).astype(int)
-
-# Flag propósitos de año nuevo (Ene 1 - Feb 15)
-df["es_resolucion_ano_nuevo"] = (
-    ((df["mes"] == 1)) | ((df["mes"] == 2) & (df["dia_mes"] <= 15))
-).astype(int)
-
-print(f"  ✓ Variables temporales creadas: {len([c for c in df.columns if c not in ['Fecha de venta']])}")
-print(f"  ✓ Eventos detectados: {df[df['tiene_evento'] == 1].shape[0]} ventas cerca de eventos")
-print(f"  ✓ Ventas en quincena: {df['es_quincena'].sum()}")
+# Factores de corrección DTF México vs H&M Europa
+# Calculados en research/dtf_finetuning.py
+DTF_CORRECCION_MENSUAL = {
+    1:  1.100,  # Enero   — ajuste moderado
+    2:  1.529,  # Febrero — 53% más que patrón H&M
+    3:  1.754,  # Marzo   — 75% más (temporada fuerte México)
+    4:  1.200,  # Abril   — estimado (sin datos suficientes)
+    5:  1.000,  # Mayo    — sin corrección (sin datos)
+    6:  1.000,  # Junio
+    7:  1.000,  # Julio
+    8:  1.000,  # Agosto
+    9:  1.000,  # Septiembre
+    10: 0.704,  # Octubre  — arranque negocio, bajo vs H&M
+    11: 0.702,  # Noviembre
+    12: 0.900,  # Diciembre — estimado
+}
 
 
-# ============================================================================
-# PASO 4: EXPORTAR DATOS LIMPIOS POR TRANSACCIÓN
-# ============================================================================
-print("\n" + "=" * 70)
-print("PASO 4: Exportar datos limpios por transacción")
-print("=" * 70)
+# ═══════════════════════════════════════════════════════════════════════════
+# 1. CARGA DE DATOS
+# ═══════════════════════════════════════════════════════════════════════════
 
-cols_export = [
-    "venta_id", "fecha", "anio_semana", "estado_venta",
-    "ingresos", "cargo_venta", "costo_envio", "total_neto",
-    "diseno", "categoria", "tipo_prenda",
-    "estado_geo", "pais", "es_internacional",
-    "anio", "mes", "semana_iso", "dia_semana", "dia_mes",
-    "es_quincena", "es_fin_de_semana", "es_inicio_mes",
-    "temporada", "evento_cercano", "tiene_evento",
-    "semanas_desde_inicio", "es_resolucion_ano_nuevo",
-]
+def cargar_archivo(ruta: str) -> pd.DataFrame:
+    """Carga Excel (.xlsx/.xls) o CSV y normaliza columnas."""
+    ruta = Path(ruta)
+    log.info(f"Cargando archivo: {ruta.name}")
 
-df_clean = df[cols_export].sort_values("fecha").reset_index(drop=True)
-df_clean.to_csv(OUTPUT_DIR / "ventas_limpias.csv", index=False)
-print(f"  ✓ ventas_limpias.csv — {len(df_clean)} registros, {len(cols_export)} columnas")
+    if not ruta.exists():
+        raise FileNotFoundError(f"No se encontró: {ruta}")
 
+    ext = ruta.suffix.lower()
+    if ext in (".xlsx", ".xls"):
+        df = pd.read_excel(ruta)
+    elif ext == ".csv":
+        # Intentar detectar separador
+        for sep in [",", ";", "\t", "|"]:
+            try:
+                df = pd.read_csv(ruta, sep=sep, encoding="utf-8")
+                if len(df.columns) > 1:
+                    break
+            except Exception:
+                continue
+        else:
+            df = pd.read_csv(ruta)
+    else:
+        raise ValueError(f"Formato no soportado: {ext}. Usa .xlsx, .xls o .csv")
 
-# ============================================================================
-# PASO 5: SERIE DE TIEMPO SEMANAL POR CATEGORÍA
-# ============================================================================
-print("\n" + "=" * 70)
-print("PASO 5: Construir serie de tiempo semanal por categoría")
-print("=" * 70)
-
-# Crear rango completo de semanas
-all_weeks = pd.date_range(
-    start=df["fecha"].min() - timedelta(days=df["fecha"].min().weekday()),
-    end=PROJECT_END,
-    freq="W-MON"
-)
-
-# Categorías principales (las que tienen suficientes datos para modelar)
-top_categorias = df["categoria"].value_counts()
-print(f"  Distribución de categorías:")
-for cat, count in top_categorias.items():
-    print(f"    {cat}: {count} ventas")
-
-categorias_modelo = top_categorias[top_categorias >= 2].index.tolist()
-
-# Agregar ventas por semana y categoría
-df["semana_inicio"] = df["fecha"] - pd.to_timedelta(df["fecha"].dt.weekday, unit="D")
-df["semana_inicio"] = df["semana_inicio"].dt.normalize()
-
-weekly_sales = df.groupby(["semana_inicio", "categoria"]).agg(
-    unidades=("venta_id", "count"),
-    ingresos_total=("ingresos", "sum"),
-    total_neto_sum=("total_neto", "sum"),
-    ticket_promedio=("ingresos", "mean"),
-    n_disenos_unicos=("diseno", "nunique"),
-    n_estados=("estado_geo", "nunique"),
-).reset_index()
-
-# Crear grid completo (todas las semanas × todas las categorías)
-week_cat_grid = pd.MultiIndex.from_product(
-    [all_weeks, categorias_modelo],
-    names=["semana_inicio", "categoria"]
-).to_frame(index=False)
-
-# Normalizar las fechas de semana para merge
-week_cat_grid["semana_inicio"] = pd.to_datetime(week_cat_grid["semana_inicio"]).dt.normalize()
-weekly_sales["semana_inicio"] = pd.to_datetime(weekly_sales["semana_inicio"]).dt.normalize()
-
-serie = week_cat_grid.merge(weekly_sales, on=["semana_inicio", "categoria"], how="left")
-
-# Llenar semanas vacías con ceros (no hay ventas = 0 unidades)
-fill_cols = ["unidades", "ingresos_total", "total_neto_sum", "ticket_promedio",
-             "n_disenos_unicos", "n_estados"]
-serie[fill_cols] = serie[fill_cols].fillna(0)
-
-# Agregar features temporales a la serie semanal
-serie["anio"] = serie["semana_inicio"].dt.year
-serie["mes"] = serie["semana_inicio"].dt.month
-serie["semana_iso"] = serie["semana_inicio"].dt.isocalendar().week.astype(int)
-serie["anio_semana"] = serie["semana_inicio"].dt.strftime("%G-W%V")
-
-# Temporada
-serie["temporada"] = serie["semana_inicio"].apply(get_temporada)
-
-# Eventos en la semana
-def semana_tiene_evento(fecha_inicio):
-    for i in range(7):
-        d = fecha_inicio + timedelta(days=i)
-        if d.strftime("%Y-%m-%d") in HOLIDAYS_MX:
-            return 1
-    return 0
-
-serie["tiene_evento_semana"] = serie["semana_inicio"].apply(semana_tiene_evento)
-
-# Propósitos de año nuevo
-serie["es_resolucion_ano_nuevo"] = (
-    ((serie["mes"] == 1)) | ((serie["mes"] == 2) & (serie["semana_inicio"].dt.day <= 15))
-).astype(int)
-
-# Semanas desde inicio del negocio
-inicio_negocio = df["fecha"].min()
-serie["semanas_desde_inicio"] = ((serie["semana_inicio"] - inicio_negocio).dt.days / 7).astype(int)
-
-serie = serie.sort_values(["categoria", "semana_inicio"]).reset_index(drop=True)
-serie.to_csv(OUTPUT_DIR / "serie_semanal.csv", index=False)
-
-n_weeks = serie["semana_inicio"].nunique()
-n_cats = serie["categoria"].nunique()
-print(f"  ✓ serie_semanal.csv — {len(serie)} filas ({n_weeks} semanas × {n_cats} categorías)")
-print(f"  ✓ Semanas cubiertas: {all_weeks[0].strftime('%Y-%m-%d')} → {all_weeks[-1].strftime('%Y-%m-%d')}")
-
-
-# ============================================================================
-# PASO 6: FEATURE ENGINEERING PARA MODELOS ML
-# ============================================================================
-print("\n" + "=" * 70)
-print("PASO 6: Feature engineering para modelos ML (lag features + rolling)")
-print("=" * 70)
-
-features = serie.copy()
-
-# LAG FEATURES (ventas de semanas anteriores como predictores)
-for lag in [1, 2, 3, 4]:
-    features[f"lag_{lag}w"] = features.groupby("categoria")["unidades"].shift(lag)
-
-# ROLLING AVERAGES (promedios móviles)
-for window in [2, 4]:
-    features[f"rolling_mean_{window}w"] = (
-        features.groupby("categoria")["unidades"]
-        .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
-    )
-    features[f"rolling_std_{window}w"] = (
-        features.groupby("categoria")["unidades"]
-        .transform(lambda x: x.shift(1).rolling(window, min_periods=1).std())
+    # Normalizar nombres de columnas
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.lower()
+        .str.replace(r"[áà]", "a", regex=True)
+        .str.replace(r"[éè]", "e", regex=True)
+        .str.replace(r"[íì]", "i", regex=True)
+        .str.replace(r"[óò]", "o", regex=True)
+        .str.replace(r"[úù]", "u", regex=True)
+        .str.replace(r"[ñ]", "n", regex=True)
+        .str.replace(r"\s+", "_", regex=True)
+        .str.replace(r"[^\w]", "", regex=True)
     )
 
-# ROLLING MAX (para detectar bursts)
-features["rolling_max_4w"] = (
-    features.groupby("categoria")["unidades"]
-    .transform(lambda x: x.shift(1).rolling(4, min_periods=1).max())
-)
-
-# TASA DE CAMBIO (aceleración de demanda)
-features["cambio_semanal"] = features.groupby("categoria")["unidades"].diff()
-features["cambio_pct"] = features.groupby("categoria")["unidades"].pct_change().replace([np.inf, -np.inf], np.nan)
-
-# VENTAS ACUMULADAS por categoría (tendencia de popularidad)
-features["ventas_acumuladas"] = features.groupby("categoria")["unidades"].cumsum()
-
-# ONE-HOT ENCODING de categoría (para Random Forest / XGBoost)
-cat_dummies = pd.get_dummies(features["categoria"], prefix="cat", dtype=int)
-features = pd.concat([features, cat_dummies], axis=1)
-
-# ONE-HOT ENCODING de temporada
-temp_dummies = pd.get_dummies(features["temporada"], prefix="temp", dtype=int)
-features = pd.concat([features, temp_dummies], axis=1)
-
-# Columna target (lo que queremos predecir)
-features["target"] = features["unidades"]
-
-# Eliminar filas con NaN en lag features (primeras semanas sin historial)
-features_complete = features.dropna(subset=["lag_1w"]).copy()
-
-# Rellenar NaN restantes con 0
-features_complete = features_complete.fillna(0)
-
-features_complete.to_csv(OUTPUT_DIR / "features_modelo.csv", index=False)
-
-feature_cols = [c for c in features_complete.columns if c.startswith(("lag_", "rolling_", "cambio",
-    "ventas_acum", "cat_", "temp_", "es_", "tiene_", "mes", "semana_iso", "semanas_desde"))]
-print(f"  ✓ features_modelo.csv — {len(features_complete)} filas, {len(feature_cols)} features predictivos")
-print(f"  Features creados:")
-print(f"    Lag features:     lag_1w, lag_2w, lag_3w, lag_4w")
-print(f"    Rolling stats:    rolling_mean_2w, rolling_mean_4w, rolling_std_2w, rolling_std_4w, rolling_max_4w")
-print(f"    Cambio:           cambio_semanal, cambio_pct")
-print(f"    Acumulado:        ventas_acumuladas")
-print(f"    Calendario:       es_quincena, es_resolucion_ano_nuevo, tiene_evento_semana")
-print(f"    Categoría:        {len([c for c in cat_dummies.columns])} dummies")
-print(f"    Temporada:        {len([c for c in temp_dummies.columns])} dummies")
+    log.info(f"  → {len(df)} filas, {len(df.columns)} columnas: {list(df.columns)}")
+    return df
 
 
-# ============================================================================
-# PASO 7: BASELINE NAIVE (punto de comparación)
-# ============================================================================
-print("\n" + "=" * 70)
-print("PASO 7: Calcular baseline naive para comparación")
-print("=" * 70)
+def detectar_columnas(df: pd.DataFrame) -> dict:
+    """Detecta automáticamente qué columnas corresponden a fecha, cantidad, precio, etc."""
+    mapeo = {}
 
-# Baseline: "la predicción de esta semana = ventas de la semana pasada"
-baseline = features_complete[["semana_inicio", "categoria", "target", "lag_1w"]].copy()
-baseline = baseline.rename(columns={"lag_1w": "prediccion_naive"})
-baseline["error_abs"] = (baseline["target"] - baseline["prediccion_naive"]).abs()
-baseline["error_pct"] = np.where(
-    baseline["target"] > 0,
-    baseline["error_abs"] / baseline["target"] * 100,
-    np.where(baseline["prediccion_naive"] > 0, 100, 0)
-)
+    # Fecha
+    for col in df.columns:
+        if any(k in col for k in ["fecha", "date", "dia", "t_dat"]):
+            mapeo["fecha"] = col
+            break
+    if "fecha" not in mapeo:
+        # Buscar columna con datos tipo datetime
+        for col in df.columns:
+            try:
+                parsed = pd.to_datetime(df[col], errors="coerce")
+                if parsed.notna().sum() > len(df) * 0.5:
+                    mapeo["fecha"] = col
+                    break
+            except Exception:
+                continue
 
-# Métricas globales
-mae_global = baseline["error_abs"].mean()
-non_zero = baseline[baseline["target"] > 0]
-mape_global = non_zero["error_pct"].mean() if len(non_zero) > 0 else float("inf")
+    # Cantidad / unidades
+    for col in df.columns:
+        if any(k in col for k in ["cantidad", "unidades", "qty", "quantity", "units"]):
+            mapeo["cantidad"] = col
+            break
 
-# R² del baseline
-ss_res = ((baseline["target"] - baseline["prediccion_naive"]) ** 2).sum()
-ss_tot = ((baseline["target"] - baseline["target"].mean()) ** 2).sum()
-r2_global = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+    # Precio
+    for col in df.columns:
+        if any(k in col for k in ["precio", "price", "monto", "total", "ingreso", "revenue"]):
+            mapeo["precio"] = col
+            break
 
-baseline.to_csv(OUTPUT_DIR / "baseline_naive.csv", index=False)
+    # Producto / diseño
+    for col in df.columns:
+        if any(k in col for k in ["producto", "diseno", "design", "sku", "article", "nombre"]):
+            mapeo["producto"] = col
+            break
 
-print(f"  ✓ baseline_naive.csv")
-print(f"  Métricas del baseline naive (punto de referencia):")
-print(f"    MAE  = {mae_global:.3f} unidades")
-print(f"    MAPE = {mape_global:.1f}%")
-print(f"    R²   = {r2_global:.4f}")
-print(f"  → Tu modelo debe superar estas métricas por 20-25% para cumplir el objetivo de la tesis")
+    # Categoría
+    for col in df.columns:
+        if any(k in col for k in ["categoria", "category", "tipo", "type", "linea"]):
+            mapeo["categoria"] = col
+            break
 
-target_mae = mae_global * 0.75
-target_mape = mape_global * 0.75
-print(f"  → Objetivo MAE  ≤ {target_mae:.3f}")
-print(f"  → Objetivo MAPE ≤ {target_mape:.1f}%")
-
-
-# ============================================================================
-# PASO 8: RESUMEN EDA (para documentación de tesis)
-# ============================================================================
-print("\n" + "=" * 70)
-print("PASO 8: Resumen exploratorio (EDA) para documentación")
-print("=" * 70)
-
-eda = df.groupby("categoria").agg(
-    total_ventas=("venta_id", "count"),
-    ingresos_total=("ingresos", "sum"),
-    total_neto=("total_neto", "sum"),
-    ticket_promedio=("ingresos", "mean"),
-    n_disenos=("diseno", "nunique"),
-    n_estados=("estado_geo", "nunique"),
-    primera_venta=("fecha", "min"),
-    ultima_venta=("fecha", "max"),
-    tipo_prenda_mas_comun=("tipo_prenda", lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else "N/A"),
-).reset_index()
-
-eda["participacion_pct"] = (eda["total_ventas"] / eda["total_ventas"].sum() * 100).round(1)
-eda["margen_pct"] = (eda["total_neto"] / eda["ingresos_total"] * 100).round(1)
-eda = eda.sort_values("total_ventas", ascending=False)
-
-eda.to_csv(OUTPUT_DIR / "resumen_eda.csv", index=False)
-print(f"  ✓ resumen_eda.csv")
-print(f"\n  Top categorías:")
-for _, row in eda.head(5).iterrows():
-    print(f"    {row['categoria']:15s} → {row['total_ventas']:3.0f} ventas ({row['participacion_pct']}%), "
-          f"margen {row['margen_pct']}%, {row['n_disenos']} diseños")
+    log.info(f"  → Mapeo detectado: {mapeo}")
+    return mapeo
 
 
-# ============================================================================
-# PASO 9: METADATA DEL PIPELINE (para trazabilidad)
-# ============================================================================
-print("\n" + "=" * 70)
-print("PASO 9: Guardar metadata del pipeline")
-print("=" * 70)
+# ═══════════════════════════════════════════════════════════════════════════
+# 2. LIMPIEZA
+# ═══════════════════════════════════════════════════════════════════════════
 
-metadata = {
-    "pipeline_version": "1.0.0",
-    "fecha_ejecucion": datetime.now().isoformat(),
-    "archivo_entrada": INPUT_FILE,
-    "registros_entrada": len(df),
-    "rango_fechas": {
-        "inicio": df["fecha"].min().isoformat(),
-        "fin": df["fecha"].max().isoformat(),
-        "semanas": int(n_weeks),
-    },
-    "categorias": sorted(df["categoria"].unique().tolist()),
-    "tipos_prenda": sorted(df["tipo_prenda"].unique().tolist()),
-    "archivos_generados": [
-        {"nombre": "ventas_limpias.csv", "filas": len(df_clean), "descripcion": "Transacciones limpias con features temporales"},
-        {"nombre": "serie_semanal.csv", "filas": len(serie), "descripcion": "Serie de tiempo semanal por categoría"},
-        {"nombre": "features_modelo.csv", "filas": len(features_complete), "descripcion": "Dataset con features para ML"},
-        {"nombre": "baseline_naive.csv", "filas": len(baseline), "descripcion": "Predicciones baseline naive"},
-        {"nombre": "resumen_eda.csv", "filas": len(eda), "descripcion": "Resumen exploratorio por categoría"},
-    ],
-    "baseline_metricas": {
-        "MAE": round(mae_global, 4),
-        "MAPE": round(mape_global, 2),
-        "R2": round(r2_global, 4),
-    },
-    "features_modelo": {
-        "lag_features": ["lag_1w", "lag_2w", "lag_3w", "lag_4w"],
-        "rolling_features": ["rolling_mean_2w", "rolling_mean_4w", "rolling_std_2w", "rolling_std_4w", "rolling_max_4w"],
-        "cambio_features": ["cambio_semanal", "cambio_pct"],
-        "acumulado": ["ventas_acumuladas"],
-        "calendario": ["es_resolucion_ano_nuevo", "tiene_evento_semana", "mes", "semana_iso", "semanas_desde_inicio"],
-        "categoricas": [c for c in cat_dummies.columns] + [c for c in temp_dummies.columns],
-    },
-    "nota_google_trends": "Pendiente: agregar columnas de Google Trends como features externos. Usar pytrends para consultar términos por categoría.",
-}
+def limpiar_datos(df: pd.DataFrame, mapeo: dict) -> pd.DataFrame:
+    """Limpia y valida los datos crudos."""
+    log.info("Limpiando datos...")
+    n_original = len(df)
 
-with open(OUTPUT_DIR / "pipeline_metadata.json", "w", encoding="utf-8") as f:
-    json.dump(metadata, f, ensure_ascii=False, indent=2, default=str)
+    # Parsear fecha
+    col_fecha = mapeo.get("fecha")
+    if col_fecha is None:
+        raise ValueError("No se detectó columna de fecha. Asegúrate de tener una columna 'fecha' o 'date'.")
+    df["fecha"] = pd.to_datetime(df[col_fecha], errors="coerce", dayfirst=True)
+    nulos_fecha = df["fecha"].isna().sum()
+    if nulos_fecha > 0:
+        log.warning(f"  → {nulos_fecha} filas con fecha inválida eliminadas")
+        df = df.dropna(subset=["fecha"])
 
-print(f"  ✓ pipeline_metadata.json")
+    # Cantidad
+    col_cant = mapeo.get("cantidad")
+    if col_cant:
+        df["cantidad"] = pd.to_numeric(df[col_cant], errors="coerce").fillna(1).astype(int)
+        df = df[df["cantidad"] > 0]
+    else:
+        df["cantidad"] = 1
+        log.warning("  → No se detectó columna de cantidad; asumiendo 1 unidad por fila")
+
+    # Precio
+    col_precio = mapeo.get("precio")
+    if col_precio:
+        df["precio_unitario"] = pd.to_numeric(df[col_precio], errors="coerce").fillna(0)
+    else:
+        df["precio_unitario"] = 0.0
+        log.warning("  → No se detectó columna de precio")
+
+    # Producto
+    col_prod = mapeo.get("producto")
+    if col_prod:
+        df["producto"] = df[col_prod].astype(str).str.strip()
+    else:
+        df["producto"] = "general"
+
+    # Categoría
+    col_cat = mapeo.get("categoria")
+    if col_cat:
+        df["categoria"] = df[col_cat].astype(str).str.strip().str.title()
+    else:
+        df["categoria"] = "General"
+
+    # Eliminar duplicados exactos
+    n_antes = len(df)
+    df = df.drop_duplicates()
+    if len(df) < n_antes:
+        log.info(f"  → {n_antes - len(df)} duplicados eliminados")
+
+    # Calcular ingreso
+    df["ingreso_bruto"] = df["cantidad"] * df["precio_unitario"]
+
+    # Generar ID de venta único
+    df["venta_id"] = df.apply(
+        lambda r: hashlib.md5(
+            f"{r['fecha']}_{r['producto']}_{r['cantidad']}_{r.name}".encode()
+        ).hexdigest()[:12],
+        axis=1,
+    )
+
+    # Ordenar por fecha
+    df = df.sort_values("fecha").reset_index(drop=True)
+
+    log.info(f"  → Limpieza completa: {n_original} → {len(df)} filas")
+    log.info(f"  → Período: {df['fecha'].min().date()} a {df['fecha'].max().date()}")
+    return df
 
 
-# ============================================================================
-# RESUMEN FINAL
-# ============================================================================
-print("\n" + "=" * 70)
-print("PIPELINE ETL COMPLETADO")
-print("=" * 70)
-print(f"""
-  Archivos generados en {OUTPUT_DIR}/:
-  
-  1. ventas_limpias.csv      → {len(df_clean)} transacciones limpias
-  2. serie_semanal.csv       → {len(serie)} filas (serie temporal)
-  3. features_modelo.csv     → {len(features_complete)} filas listas para ML
-  4. baseline_naive.csv      → {len(baseline)} predicciones de referencia
-  5. resumen_eda.csv         → {len(eda)} categorías analizadas
-  6. pipeline_metadata.json  → Trazabilidad completa
-  
-  Baseline naive:
-    MAE  = {mae_global:.3f}
-    MAPE = {mape_global:.1f}%
-    R²   = {r2_global:.4f}
-  
-  SIGUIENTE PASO:
-    → Integrar Google Trends API (pytrends) como features externos
-    → Entrenar SARIMA, Random Forest y XGBoost sobre features_modelo.csv
-    → Comparar métricas vs baseline_naive.csv
-""")
+# ═══════════════════════════════════════════════════════════════════════════
+# 3. AGREGACIÓN A SERIE TEMPORAL
+# ═══════════════════════════════════════════════════════════════════════════
+
+def agregar_serie_semanal(df: pd.DataFrame) -> pd.DataFrame:
+    """Agrega ventas diarias y rellena días sin actividad."""
+    log.info("Generando serie temporal diaria...")
+
+    fecha_min = df["fecha"].min().normalize()
+    fecha_max = df["fecha"].max().normalize()
+
+    # Crear rango completo de fechas
+    rango = pd.date_range(start=fecha_min, end=fecha_max, freq="D")
+    serie = pd.DataFrame({"fecha": rango})
+
+    # Agregar por día
+    diario = (
+        df.groupby(df["fecha"].dt.normalize())
+        .agg(
+            unidades=("cantidad", "sum"),
+            ingreso_bruto=("ingreso_bruto", "sum"),
+            num_transacciones=("venta_id", "nunique"),
+            productos_unicos=("producto", "nunique"),
+        )
+        .reset_index()
+        .rename(columns={"fecha": "fecha"})
+    )
+
+    serie = serie.merge(diario, on="fecha", how="left")
+    serie["unidades"] = serie["unidades"].fillna(0).astype(int)
+    serie["ingreso_bruto"] = serie["ingreso_bruto"].fillna(0.0)
+    serie["num_transacciones"] = serie["num_transacciones"].fillna(0).astype(int)
+    serie["productos_unicos"] = serie["productos_unicos"].fillna(0).astype(int)
+
+    # Campos temporales
+    serie["dia_semana"] = serie["fecha"].dt.dayofweek
+    serie["dia_nombre"] = serie["fecha"].dt.day_name()
+    serie["semana_iso"] = serie["fecha"].dt.isocalendar().week.astype(int)
+    serie["mes"] = serie["fecha"].dt.month
+    serie["anio"] = serie["fecha"].dt.year
+    serie["es_fin_semana"] = serie["dia_semana"].isin([5, 6]).astype(int)
+
+    # Ingreso acumulado
+    serie["ingreso_acumulado"] = serie["ingreso_bruto"].cumsum()
+
+    log.info(f"  → Serie de {len(serie)} días ({serie['unidades'].sum()} unidades totales)")
+    log.info(f"  → Días con actividad: {(serie['unidades'] > 0).sum()} de {len(serie)}")
+    return serie
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. FEATURE ENGINEERING
+# ═══════════════════════════════════════════════════════════════════════════
+
+def generar_features(serie: pd.DataFrame) -> pd.DataFrame:
+    """Genera features para los modelos ML incluyendo índices H&M."""
+    log.info("Generando features...")
+    f = serie[["fecha", "unidades", "dia_semana", "mes", "es_fin_semana"]].copy()
+
+    # ── Lags ──
+    for lag in [1, 7, 14, 21, 28]:
+        f[f"lag_{lag}"] = f["unidades"].shift(lag)
+
+    # ── Rolling stats ──
+    for ventana in [7, 14, 30]:
+        f[f"rolling_mean_{ventana}"] = (
+            f["unidades"].rolling(window=ventana, min_periods=1).mean()
+        )
+        f[f"rolling_std_{ventana}"] = (
+            f["unidades"].rolling(window=ventana, min_periods=1).std().fillna(0)
+        )
+
+    # ── Rolling max y min (ventana 7) ──
+    f["rolling_max_7"] = f["unidades"].rolling(window=7, min_periods=1).max()
+    f["rolling_min_7"] = f["unidades"].rolling(window=7, min_periods=1).min()
+
+    # ── Cambio semanal (%) ──
+    media_actual = f["unidades"].rolling(window=7, min_periods=1).mean()
+    media_anterior = f["unidades"].shift(7).rolling(window=7, min_periods=1).mean()
+    f["cambio_semanal_pct"] = ((media_actual - media_anterior) / media_anterior.replace(0, np.nan) * 100).fillna(0)
+
+    # ── Momentum (diferencia absoluta vs semana pasada) ──
+    f["momentum_7d"] = f["unidades"] - f["unidades"].shift(7)
+    f["momentum_7d"] = f["momentum_7d"].fillna(0)
+
+    # ── Índices estacionales H&M ──
+    f["hm_indice_semanal"] = f["dia_semana"].map(HM_INDICE_SEMANAL)
+    f["hm_indice_mensual"] = f["mes"].map(HM_INDICE_MENSUAL)
+    f["hm_correccion_dtf"] = f["mes"].map(DTF_CORRECCION_MENSUAL)
+
+    # Índice combinado H&M calibrado
+    f["hm_indice_combinado"] = (
+        f["hm_indice_semanal"] * f["hm_indice_mensual"] * f["hm_correccion_dtf"]
+    )
+
+    # ── Encoding cíclico para día y mes ──
+    f["dia_sin"] = np.sin(2 * np.pi * f["dia_semana"] / 7)
+    f["dia_cos"] = np.cos(2 * np.pi * f["dia_semana"] / 7)
+    f["mes_sin"] = np.sin(2 * np.pi * f["mes"] / 12)
+    f["mes_cos"] = np.cos(2 * np.pi * f["mes"] / 12)
+
+    # ── Días desde inicio ──
+    f["dias_desde_inicio"] = (f["fecha"] - f["fecha"].min()).dt.days
+
+    # ── Tendencia lineal normalizada [0,1] ──
+    max_dias = f["dias_desde_inicio"].max()
+    f["tendencia_norm"] = f["dias_desde_inicio"] / max_dias if max_dias > 0 else 0
+
+    # ── Rellenar NaN restantes ──
+    f = f.fillna(0)
+
+    n_features = len([c for c in f.columns if c not in ("fecha", "unidades")])
+    log.info(f"  → {n_features} features generados")
+    return f
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. ESCRITURA A POSTGRESQL
+# ═══════════════════════════════════════════════════════════════════════════
+
+def escribir_a_db(
+    df_ventas: pd.DataFrame,
+    df_serie: pd.DataFrame,
+    df_features: pd.DataFrame,
+) -> dict:
+    """Escribe los DataFrames procesados a PostgreSQL."""
+    log.info("Escribiendo a base de datos...")
+    db = engine()
+    resumen = {}
+
+    # ── Tabla: ventas ──
+    cols_ventas = [
+        "venta_id", "fecha", "producto", "categoria",
+        "cantidad", "precio_unitario", "ingreso_bruto",
+    ]
+    df_v = df_ventas[[c for c in cols_ventas if c in df_ventas.columns]].copy()
+    df_v["created_at"] = datetime.now()
+
+    # Limpiar tabla existente e insertar
+    with db.begin() as conn:
+        conn.execute(text("DELETE FROM ventas"))
+    write_dataframe(df_v, "ventas", if_exists="append")
+    resumen["ventas"] = len(df_v)
+    log.info(f"  → ventas: {len(df_v)} registros")
+
+    # ── Tabla: serie_semanal ──
+    cols_serie = [
+        "fecha", "unidades", "ingreso_bruto", "num_transacciones",
+        "productos_unicos", "dia_semana", "dia_nombre", "semana_iso",
+        "mes", "anio", "es_fin_semana", "ingreso_acumulado",
+    ]
+    df_s = df_serie[[c for c in cols_serie if c in df_serie.columns]].copy()
+    df_s["created_at"] = datetime.now()
+
+    with db.begin() as conn:
+        conn.execute(text("DELETE FROM serie_semanal"))
+    write_dataframe(df_s, "serie_semanal", if_exists="append")
+    resumen["serie_semanal"] = len(df_s)
+    log.info(f"  → serie_semanal: {len(df_s)} registros")
+
+    # ── Tabla: features ──
+    df_f = df_features.copy()
+    df_f["created_at"] = datetime.now()
+
+    with db.begin() as conn:
+        conn.execute(text("DELETE FROM features"))
+    write_dataframe(df_f, "features", if_exists="append")
+    resumen["features"] = len(df_f)
+    log.info(f"  → features: {len(df_f)} registros")
+
+    # ── Tabla: factores_hm ──
+    factores = []
+    for dia, idx in HM_INDICE_SEMANAL.items():
+        factores.append({
+            "tipo": "semanal",
+            "clave": str(dia),
+            "valor": idx,
+            "descripcion": f"Índice día {dia} (0=Lun, 6=Dom)",
+        })
+    for mes, idx in HM_INDICE_MENSUAL.items():
+        factores.append({
+            "tipo": "mensual",
+            "clave": str(mes),
+            "valor": idx,
+            "descripcion": f"Índice mes {mes}",
+        })
+    for mes, corr in DTF_CORRECCION_MENSUAL.items():
+        factores.append({
+            "tipo": "correccion_dtf",
+            "clave": str(mes),
+            "valor": corr,
+            "descripcion": f"Corrección DTF mes {mes}",
+        })
+
+    df_hm = pd.DataFrame(factores)
+    df_hm["created_at"] = datetime.now()
+
+    with db.begin() as conn:
+        conn.execute(text("DELETE FROM factores_hm"))
+    write_dataframe(df_hm, "factores_hm", if_exists="append")
+    resumen["factores_hm"] = len(df_hm)
+    log.info(f"  → factores_hm: {len(df_hm)} registros")
+
+    return resumen
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6. PIPELINE PRINCIPAL
+# ═══════════════════════════════════════════════════════════════════════════
+
+def ejecutar_pipeline(ruta_archivo: str) -> dict:
+    """
+    Pipeline ETL completo:
+      1. Carga archivo Excel/CSV
+      2. Detecta columnas automáticamente
+      3. Limpia y valida
+      4. Agrega serie temporal diaria
+      5. Genera features (lags, rolling, H&M)
+      6. Escribe todo a PostgreSQL
+
+    Returns:
+        dict con resumen de registros insertados y metadata
+    """
+    log.info("=" * 70)
+    log.info("INICIO PIPELINE ETL v4.0 — DTF Fashion")
+    log.info("=" * 70)
+    t0 = datetime.now()
+
+    # Paso 1: Cargar
+    df_raw = cargar_archivo(ruta_archivo)
+
+    # Paso 2: Detectar columnas
+    mapeo = detectar_columnas(df_raw)
+
+    # Paso 3: Limpiar
+    df_limpio = limpiar_datos(df_raw, mapeo)
+
+    # Paso 4: Agregar serie diaria
+    df_serie = agregar_serie_semanal(df_limpio)
+
+    # Paso 5: Features
+    df_features = generar_features(df_serie)
+
+    # Paso 6: Escribir a DB
+    resumen_db = escribir_a_db(df_limpio, df_serie, df_features)
+
+    elapsed = (datetime.now() - t0).total_seconds()
+
+    resultado = {
+        "status": "ok",
+        "archivo": str(ruta_archivo),
+        "filas_crudas": len(df_raw),
+        "filas_limpias": len(df_limpio),
+        "dias_serie": len(df_serie),
+        "features_generados": len([
+            c for c in df_features.columns if c not in ("fecha", "unidades")
+        ]),
+        "periodo": {
+            "inicio": str(df_limpio["fecha"].min().date()),
+            "fin": str(df_limpio["fecha"].max().date()),
+        },
+        "unidades_totales": int(df_limpio["cantidad"].sum()),
+        "ingreso_total": float(df_limpio["ingreso_bruto"].sum()),
+        "registros_db": resumen_db,
+        "tiempo_seg": round(elapsed, 2),
+    }
+
+    log.info("=" * 70)
+    log.info(f"PIPELINE COMPLETADO en {elapsed:.1f}s")
+    log.info(f"  Filas: {resultado['filas_crudas']} → {resultado['filas_limpias']}")
+    log.info(f"  Serie: {resultado['dias_serie']} días")
+    log.info(f"  Unidades: {resultado['unidades_totales']}")
+    log.info("=" * 70)
+
+    return resultado
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Uso: python etl_pipeline.py <ruta_archivo.xlsx|csv>")
+        print("Ejemplo: python etl_pipeline.py data/ventas_dtf.xlsx")
+        sys.exit(1)
+
+    resultado = ejecutar_pipeline(sys.argv[1])
+    print("\n✅ Resultado:")
+    for k, v in resultado.items():
+        print(f"  {k}: {v}")

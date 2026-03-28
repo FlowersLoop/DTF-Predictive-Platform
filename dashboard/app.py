@@ -1,820 +1,818 @@
 """
-============================================================================
-Dashboard Analítico — Plataforma Predictiva DTF
-============================================================================
-Dashboard interactivo con Streamlit que visualiza pronósticos de demanda,
-rankings de categorías y recomendaciones de producción DTF.
-
-Ejecución:
-  streamlit run dashboard/app.py
-
-Consume los CSVs generados por etl_pipeline.py y train_models.py.
-No requiere que la API FastAPI esté corriendo.
-============================================================================
+Streamlit Dashboard v4.0 — DTF Fashion Predictive Analytics Platform
+5 Tabs: Pronósticos, Comparación de Modelos, Producción, Google Trends, Datos.
 """
 
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import os
+import sys
 import json
+import logging
+from datetime import datetime, timedelta
 from pathlib import Path
-from datetime import datetime
 
-# ============================================================================
-# CONFIGURACIÓN DE PÁGINA
-# ============================================================================
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from database.connection import read_sql, engine
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("dashboard")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════════════════
+
 st.set_page_config(
-    page_title="DTF Predictive Platform",
-    page_icon="🎯",
+    page_title="DTF Fashion — Análisis Predictivo",
+    page_icon="🧵",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ============================================================================
-# ESTILOS CSS
-# ============================================================================
-st.markdown("""
-<style>
-    /* Tipografía general */
-    .main .block-container {
-        padding-top: 2rem;
-        max-width: 1200px;
-    }
+API_URL = os.getenv("API_URL", "http://localhost:8000")
 
-    /* Métricas */
-    [data-testid="stMetric"] {
-        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-        padding: 1rem 1.25rem;
-        border-radius: 12px;
-        border: 1px solid rgba(255,255,255,0.06);
-    }
-    [data-testid="stMetricLabel"] {
-        font-size: 0.85rem !important;
-        color: #8892a4 !important;
-    }
-    [data-testid="stMetricValue"] {
-        font-size: 1.6rem !important;
-        font-weight: 700 !important;
-    }
-
-    /* Tabs */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        padding: 10px 20px;
-        border-radius: 8px;
-    }
-
-    /* Sidebar */
-    [data-testid="stSidebar"] {
-        padding-top: 1.5rem;
-    }
-
-    /* Alertas de producción */
-    .prod-alta {
-        background: rgba(239, 68, 68, 0.12);
-        border-left: 4px solid #ef4444;
-        padding: 12px 16px;
-        border-radius: 0 8px 8px 0;
-        margin-bottom: 8px;
-    }
-    .prod-media {
-        background: rgba(245, 158, 11, 0.12);
-        border-left: 4px solid #f59e0b;
-        padding: 12px 16px;
-        border-radius: 0 8px 8px 0;
-        margin-bottom: 8px;
-    }
-    .prod-baja {
-        background: rgba(34, 197, 94, 0.12);
-        border-left: 4px solid #22c55e;
-        padding: 12px 16px;
-        border-radius: 0 8px 8px 0;
-        margin-bottom: 8px;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# ============================================================================
-# CARGA DE DATOS
-# ============================================================================
-# Rutas relativas al proyecto
-# Ajustar según la estructura de tu repositorio
-DATA_PATHS = [
-    Path("data/processed"),           # Si corres desde la raíz del proyecto
-    Path("data"),                      # Si los datos están planos en data/
-    Path("../data/processed"),         # Si corres desde dashboard/
-    Path("../data"),                   # Si los datos están planos
-    Path("/home/claude/outputs"),      # Desarrollo
-]
-
-MODEL_PATHS = [
-    Path("models/saved"),
-    Path("models"),
-    Path("../models/saved"),
-    Path("../models"),
-    Path("/home/claude/models"),
-]
+# Colores del tema
+COLORS = {
+    "primary": "#1E3A5F",
+    "accent": "#3B82F6",
+    "success": "#10B981",
+    "warning": "#F59E0B",
+    "danger": "#EF4444",
+    "gray": "#6B7280",
+    "light": "#F3F4F6",
+    "banda": "rgba(59,130,246,0.15)",
+}
 
 
-def find_file(filename, search_paths):
-    """Busca un archivo en múltiples rutas posibles."""
-    for base in search_paths:
-        path = base / filename
-        if path.exists():
-            return path
-    return None
+# ═══════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=60)
+def cargar_serie():
+    try:
+        return read_sql("SELECT * FROM serie_semanal ORDER BY fecha")
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=60)
+def cargar_predicciones():
+    try:
+        return read_sql("""
+            SELECT p.*, t.modelo_ganador
+            FROM predicciones p
+            LEFT JOIN training_runs t ON p.run_id = t.run_id
+            ORDER BY p.modelo, p.fecha_prediccion
+        """)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=60)
+def cargar_metricas():
+    try:
+        runs = read_sql("SELECT * FROM training_runs ORDER BY fecha_ejecucion DESC LIMIT 1")
+        if runs.empty:
+            return pd.DataFrame(), {}
+        run = runs.iloc[0]
+        metricas = read_sql(f"SELECT * FROM metricas_modelos WHERE run_id = '{run['run_id']}' ORDER BY mape")
+        return metricas, run.to_dict()
+    except Exception:
+        return pd.DataFrame(), {}
+
+
+@st.cache_data(ttl=60)
+def cargar_ventas():
+    try:
+        return read_sql("SELECT * FROM ventas ORDER BY fecha")
+    except Exception:
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=300)
-def load_data():
-    """Carga todos los datasets necesarios."""
-    data = {}
-
-    files_data = {
-        "ventas": ("ventas_limpias.csv", DATA_PATHS),
-        "serie": ("serie_semanal.csv", DATA_PATHS),
-        "features": ("features_modelo.csv", DATA_PATHS),
-        "baseline": ("baseline_naive.csv", DATA_PATHS),
-        "eda": ("resumen_eda.csv", DATA_PATHS),
-    }
-
-    files_models = {
-        "predicciones": ("predicciones_completas.csv", MODEL_PATHS),
-        "comparacion": ("comparacion_modelos.csv", MODEL_PATHS),
-        "importance": ("feature_importance.csv", MODEL_PATHS),
-    }
-
-    for key, (filename, paths) in {**files_data, **files_models}.items():
-        filepath = find_file(filename, paths)
-        if filepath:
-            data[key] = pd.read_csv(filepath)
-            if "semana_inicio" in data[key].columns:
-                data[key]["semana_inicio"] = pd.to_datetime(data[key]["semana_inicio"])
-            if "fecha" in data[key].columns:
-                data[key]["fecha"] = pd.to_datetime(data[key]["fecha"])
-
-    # Cargar reporte JSON
-    report_path = find_file("training_report.json", MODEL_PATHS)
-    if report_path:
-        with open(report_path) as f:
-            data["report"] = json.load(f)
-
-    return data
+def cargar_factores_hm():
+    try:
+        return read_sql("SELECT * FROM factores_hm ORDER BY tipo, clave")
+    except Exception:
+        return pd.DataFrame()
 
 
-data = load_data()
+def check_db():
+    """Verifica conexión a base de datos."""
+    try:
+        df = read_sql("SELECT 1 AS ok")
+        return True
+    except Exception:
+        return False
 
-# Verificar que los datos se cargaron
-if not data:
-    st.error("No se encontraron datos. Ejecuta primero `python etl/etl_pipeline.py` y `python models/train_models.py`.")
-    st.stop()
 
-# ============================================================================
-# PALETA DE COLORES
-# ============================================================================
-COLORS = {
-    "Sports": "#ef4444",
-    "Gym": "#10b981",
-    "Futbol": "#3b82f6",
-    "Basketball": "#8b5cf6",
-    "Tenis": "#f59e0b",
-    "Casual": "#6b7280",
-    "Movies": "#ec4899",
-    "Musica": "#f97316",
-    "Hockey": "#06b6d4",
-    "Deportiva": "#14b8a6",
-    "Skateboarding": "#64748b",
-    "Baseball": "#a855f7",
-    "Ufc": "#dc2626",
-}
-
-COLOR_LIST = ["#ef4444", "#10b981", "#3b82f6", "#8b5cf6", "#f59e0b",
-              "#ec4899", "#f97316", "#06b6d4", "#6b7280", "#14b8a6"]
-
-# ============================================================================
+# ═══════════════════════════════════════════════════════════════════════════
 # SIDEBAR
-# ============================================================================
+# ═══════════════════════════════════════════════════════════════════════════
+
 with st.sidebar:
-    st.markdown("## 🎯 DTF Predictive Platform")
-    st.markdown("---")
+    st.image("https://img.icons8.com/fluency/96/fabric-textile.png", width=60)
+    st.title("DTF Fashion")
+    st.caption("Plataforma de Análisis Predictivo con IA")
+    st.divider()
 
-    # Selector de categoría
-    if "serie" in data:
-        categorias = sorted(data["serie"]["categoria"].unique())
-        categoria_sel = st.selectbox(
-            "Categoría",
-            ["Todas"] + categorias,
-            index=0,
-        )
+    # Status de DB
+    db_ok = check_db()
+    if db_ok:
+        st.success("🟢 Base de datos conectada")
     else:
-        categoria_sel = "Todas"
+        st.error("🔴 Sin conexión a base de datos")
+        st.info("Verifica que PostgreSQL esté corriendo o que SQLite esté disponible.")
 
-    st.markdown("---")
+    st.divider()
 
-    # Info del modelo
-    if "report" in data:
-        report = data["report"]
-        mejor = report.get("mejor_modelo", {})
-        st.markdown("### Modelo activo")
-        st.markdown(f"**{mejor.get('nombre', 'N/A')}**")
-        st.markdown(f"Mejora: `{mejor.get('mejora', 'N/A')}`")
-
-        fecha_train = report.get("fecha", "")
-        if fecha_train:
-            try:
-                dt = datetime.fromisoformat(fecha_train)
-                st.markdown(f"Entrenado: `{dt.strftime('%d %b %Y %H:%M')}`")
-            except Exception:
-                pass
-
-    st.markdown("---")
-
-    # Datos del negocio
-    if "ventas" in data:
-        v = data["ventas"]
-        st.markdown("### Datos del negocio")
-        st.markdown(f"📦 **{len(v)}** ventas registradas")
-        st.markdown(f"📅 {v['fecha'].min().strftime('%d %b %Y')} → {v['fecha'].max().strftime('%d %b %Y')}")
-        st.markdown(f"🏷️ **{v['categoria'].nunique()}** categorías")
-        st.markdown(f"🎨 **{v['diseno'].nunique()}** diseños únicos")
-
-    st.markdown("---")
-    st.markdown(
-        "<div style='font-size:11px;color:#6b7280;text-align:center;'>"
-        "Plataforma Predictiva DTF v1.0<br>Proyecto de Titulación 2026"
-        "</div>",
-        unsafe_allow_html=True,
+    # Upload de datos
+    st.subheader("📁 Subir datos")
+    uploaded_file = st.file_uploader(
+        "Excel o CSV con ventas",
+        type=["xlsx", "xls", "csv"],
+        help="Archivo con columnas: fecha, cantidad/unidades, precio (opcional), producto (opcional), categoría (opcional)",
     )
 
+    if uploaded_file:
+        if st.button("🚀 Procesar datos", type="primary", use_container_width=True):
+            with st.spinner("Ejecutando pipeline ETL..."):
+                try:
+                    # Guardar temporalmente
+                    import tempfile
+                    tmp = Path(tempfile.mkdtemp()) / uploaded_file.name
+                    tmp.write_bytes(uploaded_file.read())
 
-# ============================================================================
-# HEADER
-# ============================================================================
-st.markdown("# Plataforma Predictiva DTF")
-st.markdown("Análisis predictivo de demanda para producción Direct-to-Film")
-st.markdown("---")
+                    from etl.etl_pipeline import ejecutar_pipeline
+                    resultado = ejecutar_pipeline(str(tmp))
+
+                    st.success(f"✅ {resultado['filas_limpias']} registros procesados")
+                    st.json(resultado)
+
+                    # Limpiar cache
+                    st.cache_data.clear()
+
+                    # Limpiar temporal
+                    import shutil
+                    shutil.rmtree(tmp.parent, ignore_errors=True)
+
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+    st.divider()
+
+    # Entrenamiento
+    st.subheader("🧠 Entrenar modelos")
+    if st.button("Entrenar SARIMA + Prophet + RF", use_container_width=True):
+        with st.spinner("Entrenando modelos... (puede tardar 1-2 min)"):
+            try:
+                from models.train_models import ejecutar_entrenamiento
+                resultado = ejecutar_entrenamiento()
+
+                if resultado["status"] == "ok":
+                    st.success(f"🏆 Ganador: {resultado['ganador']}")
+                    st.cache_data.clear()
+                else:
+                    st.error(resultado.get("mensaje", "Error desconocido"))
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    st.divider()
+    st.caption("v4.0 — Proyecto de titulación Ibero 2026")
+    st.caption("Pipeline: SARIMA · Prophet · Random Forest · H&M Transfer")
 
 
-# ============================================================================
-# MÉTRICAS PRINCIPALES (fila superior)
-# ============================================================================
-if "ventas" in data and "comparacion" in data:
-    v = data["ventas"]
-    comp = data["comparacion"]
-
-    # Mejor modelo
-    best_row = comp[comp["modelo"] != "Baseline Naive"].sort_values("MAE").iloc[0]
-    mejora = best_row.get("mejora_mae_pct", 0)
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-        total_ventas = len(v)
-        st.metric("Total ventas", f"{total_ventas}", delta=f"+{len(v[v['mes'] >= 3])} este mes")
-
-    with col2:
-        ingresos = v["ingresos"].sum()
-        st.metric("Ingresos totales", f"${ingresos:,.0f} MXN")
-
-    with col3:
-        st.metric("Mejor modelo (R²)", f"{best_row['R2']:.2f}", delta=f"+{mejora:.0f}% vs baseline")
-
-    with col4:
-        if "predicciones" in data:
-            p = data["predicciones"]
-            demanda_total = p["pred_ensemble"].sum()
-            st.metric("Demanda predicha", f"{demanda_total:.0f} unidades", delta="próximas 4 sem.")
-
-    st.markdown("")
-
-
-# ============================================================================
+# ═══════════════════════════════════════════════════════════════════════════
 # TABS PRINCIPALES
-# ============================================================================
-tab_pronostico, tab_ranking, tab_alertas, tab_modelos, tab_datos = st.tabs([
+# ═══════════════════════════════════════════════════════════════════════════
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📈 Pronósticos",
-    "🏆 Ranking de Categorías",
-    "🚨 Alertas de Producción",
-    "🤖 Modelos ML",
-    "📊 Exploración de Datos",
+    "🏆 Comparación de Modelos",
+    "🏭 Producción DTF",
+    "🔍 Google Trends",
+    "📊 Datos",
 ])
 
 
-# ============================================================================
+# ═══════════════════════════════════════════════════════════════════════════
 # TAB 1: PRONÓSTICOS
-# ============================================================================
-with tab_pronostico:
-    st.markdown("### Demanda histórica vs pronóstico")
+# ═══════════════════════════════════════════════════════════════════════════
 
-    if "serie" in data and "predicciones" in data:
-        serie = data["serie"]
-        pred = data["predicciones"]
+with tab1:
+    st.header("Pronóstico de Demanda — Próximos 30 días")
 
-        # Filtrar por categoría seleccionada
-        if categoria_sel != "Todas":
-            serie_filt = serie[serie["categoria"] == categoria_sel]
-            pred_filt = pred[pred["categoria"] == categoria_sel]
-        else:
-            # Agregar todas las categorías
-            serie_filt = serie.groupby("semana_inicio").agg(
-                unidades=("unidades", "sum"),
-                ingresos_total=("ingresos_total", "sum"),
-            ).reset_index()
-            pred_filt = pred.groupby("semana_inicio").agg(
-                ventas_reales=("ventas_reales", "sum"),
-                pred_ensemble=("pred_ensemble", "sum"),
-                pred_rf=("pred_rf", "sum"),
-                pred_gb=("pred_gb", "sum"),
-            ).reset_index()
+    pred = cargar_predicciones()
+    serie = cargar_serie()
 
-        # Gráfica principal: historial + predicción
-        fig = go.Figure()
+    if pred.empty:
+        st.warning("No hay predicciones aún. Sube tus datos y entrena los modelos desde la barra lateral.")
+        st.stop()
 
-        # Línea histórica
-        fig.add_trace(go.Scatter(
-            x=serie_filt["semana_inicio"],
-            y=serie_filt["unidades"],
-            mode="lines+markers",
-            name="Ventas reales",
-            line=dict(color="#3b82f6", width=2.5),
-            marker=dict(size=6),
-        ))
+    pred["fecha_prediccion"] = pd.to_datetime(pred["fecha_prediccion"])
+    serie["fecha"] = pd.to_datetime(serie["fecha"])
 
-        # Línea de predicción
-        if len(pred_filt) > 0:
-            fig.add_trace(go.Scatter(
-                x=pred_filt["semana_inicio"],
-                y=pred_filt["pred_ensemble"],
-                mode="lines+markers",
-                name="Pronóstico (ensemble)",
-                line=dict(color="#10b981", width=2.5, dash="dash"),
-                marker=dict(size=8, symbol="diamond"),
-            ))
+    # Modelo ganador
+    ganador = pred["modelo_ganador"].iloc[0] if "modelo_ganador" in pred.columns else "N/A"
+    pred_ganador = pred[pred["modelo"] == ganador]
 
-            # Ventas reales en periodo de test (para comparar)
-            col_real = "ventas_reales" if "ventas_reales" in pred_filt.columns else "unidades"
-            if col_real in pred_filt.columns:
-                fig.add_trace(go.Scatter(
-                    x=pred_filt["semana_inicio"],
-                    y=pred_filt[col_real],
-                    mode="markers",
-                    name="Real (test)",
-                    marker=dict(size=10, color="#ef4444", symbol="circle-open", line=dict(width=2)),
-                ))
+    # KPIs
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        total = pred_ganador["unidades_predichas"].sum()
+        st.metric("📦 Unidades estimadas (30d)", f"{total:.0f}")
+    with col2:
+        rango_inf = pred_ganador["banda_inferior"].sum()
+        rango_sup = pred_ganador["banda_superior"].sum()
+        st.metric("📊 Rango ±30%", f"{rango_inf:.0f} – {rango_sup:.0f}")
+    with col3:
+        prom = pred_ganador["unidades_predichas"].mean()
+        st.metric("📅 Promedio diario", f"{prom:.1f} uds")
+    with col4:
+        st.metric("🏆 Modelo ganador", ganador)
 
-        fig.update_layout(
-            height=420,
-            margin=dict(l=20, r=20, t=40, b=20),
-            xaxis_title="Semana",
-            yaxis_title="Unidades vendidas",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            hovermode="x unified",
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-        )
-        fig.update_xaxes(gridcolor="rgba(128,128,128,0.1)")
-        fig.update_yaxes(gridcolor="rgba(128,128,128,0.1)")
+    st.divider()
 
-        st.plotly_chart(fig, use_container_width=True)
+    # Gráfica principal: Histórico + Forecast con bandas
+    fig = go.Figure()
 
-        # Gráfica por categoría (si es "Todas")
-        if categoria_sel == "Todas" and "predicciones" in data:
-            st.markdown("### Pronóstico por categoría")
+    # Histórico
+    fig.add_trace(go.Bar(
+        x=serie["fecha"],
+        y=serie["unidades"],
+        name="Ventas reales",
+        marker_color=COLORS["accent"],
+        opacity=0.6,
+    ))
 
-            pred_cat = pred.groupby("categoria")["pred_ensemble"].sum().sort_values(ascending=True)
+    # Forecast del ganador
+    fig.add_trace(go.Scatter(
+        x=pred_ganador["fecha_prediccion"],
+        y=pred_ganador["unidades_predichas"],
+        name=f"Forecast ({ganador})",
+        mode="lines+markers",
+        line=dict(color=COLORS["success"], width=2.5),
+        marker=dict(size=5),
+    ))
 
-            fig_bar = go.Figure()
-            fig_bar.add_trace(go.Bar(
-                y=pred_cat.index,
-                x=pred_cat.values,
-                orientation="h",
-                marker=dict(
-                    color=[COLORS.get(c, "#6b7280") for c in pred_cat.index],
-                    cornerradius=4,
-                ),
-                text=[f"{v:.1f}" for v in pred_cat.values],
-                textposition="outside",
-            ))
-            fig_bar.update_layout(
-                height=max(300, len(pred_cat) * 45),
-                margin=dict(l=20, r=60, t=20, b=20),
-                xaxis_title="Unidades predichas (próximas 4 semanas)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                paper_bgcolor="rgba(0,0,0,0)",
-            )
-            fig_bar.update_xaxes(gridcolor="rgba(128,128,128,0.1)")
+    # Banda de incertidumbre
+    fig.add_trace(go.Scatter(
+        x=pd.concat([pred_ganador["fecha_prediccion"], pred_ganador["fecha_prediccion"][::-1]]),
+        y=pd.concat([pred_ganador["banda_superior"], pred_ganador["banda_inferior"][::-1]]),
+        fill="toself",
+        fillcolor=COLORS["banda"],
+        line=dict(color="rgba(0,0,0,0)"),
+        name="Banda ±30%",
+        showlegend=True,
+    ))
 
-            st.plotly_chart(fig_bar, use_container_width=True)
+    fig.update_layout(
+        title="Ventas Históricas + Pronóstico 30 días",
+        xaxis_title="Fecha",
+        yaxis_title="Unidades vendidas",
+        template="plotly_white",
+        height=500,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
-    else:
-        st.info("Ejecuta el pipeline de entrenamiento para ver pronósticos.")
+    # Selector de modelo para ver todos
+    st.subheader("Ver por modelo")
+    modelos_disponibles = pred["modelo"].unique().tolist()
+    modelo_sel = st.selectbox("Selecciona modelo:", modelos_disponibles, index=0)
 
+    pred_sel = pred[pred["modelo"] == modelo_sel]
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.metric(f"Total {modelo_sel}", f"{pred_sel['unidades_predichas'].sum():.0f} uds")
+    with col_b:
+        st.metric("Promedio diario", f"{pred_sel['unidades_predichas'].mean():.1f} uds")
 
-# ============================================================================
-# TAB 2: RANKING DE CATEGORÍAS
-# ============================================================================
-with tab_ranking:
-    st.markdown("### Ranking de categorías por demanda")
-
-    if "predicciones" in data and "serie" in data:
-        pred = data["predicciones"]
-        serie = data["serie"]
-
-        ranking = pred.groupby("categoria").agg(
-            demanda_predicha=("pred_ensemble", "sum"),
-            confianza=("confianza", "mean"),
-        ).sort_values("demanda_predicha", ascending=False)
-
-        # Calcular tendencia
-        tendencias = {}
-        for cat in ranking.index:
-            cat_hist = serie[serie["categoria"] == cat].sort_values("semana_inicio")
-            if len(cat_hist) >= 4:
-                recent = cat_hist["unidades"].tail(4).values
-                first = recent[:2].mean()
-                second = recent[2:].mean()
-                if second > first * 1.2:
-                    tendencias[cat] = "📈 Subiendo"
-                elif second < first * 0.8:
-                    tendencias[cat] = "📉 Bajando"
-                else:
-                    tendencias[cat] = "➡️ Estable"
-            else:
-                tendencias[cat] = "❓ Sin datos"
-
-        ranking["tendencia"] = ranking.index.map(tendencias)
-
-        # Mostrar como cards
-        for i, (cat, row) in enumerate(ranking.iterrows()):
-            col_rank, col_name, col_demand, col_trend, col_conf = st.columns([0.5, 2, 1.5, 1.5, 1])
-
-            with col_rank:
-                st.markdown(f"### {i+1}")
-            with col_name:
-                st.markdown(f"**{cat}**")
-                # Mini sparkline del historial
-                cat_hist = serie[serie["categoria"] == cat].sort_values("semana_inicio")
-                if len(cat_hist) > 0:
-                    fig_spark = go.Figure()
-                    fig_spark.add_trace(go.Scatter(
-                        x=cat_hist["semana_inicio"],
-                        y=cat_hist["unidades"],
-                        mode="lines",
-                        fill="tozeroy",
-                        line=dict(color=COLORS.get(cat, "#6b7280"), width=1.5),
-                        fillcolor=f"rgba({int(COLORS.get(cat, '#6b7280')[1:3], 16)},{int(COLORS.get(cat, '#6b7280')[3:5], 16)},{int(COLORS.get(cat, '#6b7280')[5:7], 16)},0.15)",
-                    ))
-                    fig_spark.update_layout(
-                        height=50, margin=dict(l=0, r=0, t=0, b=0),
-                        xaxis=dict(visible=False), yaxis=dict(visible=False),
-                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                        showlegend=False,
-                    )
-                    st.plotly_chart(fig_spark, use_container_width=True, key=f"spark_{cat}")
-
-            with col_demand:
-                st.metric("Demanda", f"{row['demanda_predicha']:.1f} u.")
-            with col_trend:
-                st.markdown(f"<br>{row['tendencia']}", unsafe_allow_html=True)
-            with col_conf:
-                st.metric("Confianza", f"{row['confianza']:.0f}%")
-
-            if i < len(ranking) - 1:
-                st.markdown("---")
-
-    else:
-        st.info("Datos de predicción no disponibles.")
-
-
-# ============================================================================
-# TAB 3: ALERTAS DE PRODUCCIÓN
-# ============================================================================
-with tab_alertas:
-    st.markdown("### Recomendaciones de producción DTF")
-    st.markdown("Basadas en los pronósticos de demanda para las próximas 4 semanas.")
-
-    if "predicciones" in data:
-        pred = data["predicciones"]
-
-        summary = pred.groupby("categoria").agg(
-            demanda=("pred_ensemble", "sum"),
-            confianza=("confianza", "mean"),
-            max_semana=("pred_ensemble", "max"),
-        ).sort_values("demanda", ascending=False)
-
-        # Separar por prioridad
-        alta = summary[summary["demanda"] >= 4]
-        media = summary[(summary["demanda"] >= 2) & (summary["demanda"] < 4)]
-        baja = summary[(summary["demanda"] >= 0.5) & (summary["demanda"] < 2)]
-        none = summary[summary["demanda"] < 0.5]
-
-        # PRIORIDAD ALTA
-        if len(alta) > 0:
-            st.markdown("#### 🔴 Prioridad ALTA — Producir inmediatamente")
-            for cat, row in alta.iterrows():
-                st.markdown(
-                    f"""<div class="prod-alta">
-                    <strong>{cat}</strong> — {row['demanda']:.0f} unidades predichas<br>
-                    <span style="font-size:0.9em;color:#fca5a5;">
-                    Acción: Imprimir {int(np.ceil(row['demanda']))}+ unidades esta semana.
-                    Pico de {row['max_semana']:.1f} u/semana esperado.
-                    Confianza: {row['confianza']:.0f}%
-                    </span></div>""",
-                    unsafe_allow_html=True,
-                )
-
-        # PRIORIDAD MEDIA
-        if len(media) > 0:
-            st.markdown("#### 🟡 Prioridad MEDIA — Preparar lote moderado")
-            for cat, row in media.iterrows():
-                st.markdown(
-                    f"""<div class="prod-media">
-                    <strong>{cat}</strong> — {row['demanda']:.1f} unidades predichas<br>
-                    <span style="font-size:0.9em;color:#fcd34d;">
-                    Acción: Preparar {int(np.ceil(row['demanda']))} unidades. Monitorear tendencia.
-                    Confianza: {row['confianza']:.0f}%
-                    </span></div>""",
-                    unsafe_allow_html=True,
-                )
-
-        # PRIORIDAD BAJA
-        if len(baja) > 0:
-            st.markdown("#### 🟢 Prioridad BAJA — Impresión bajo demanda")
-            for cat, row in baja.iterrows():
-                st.markdown(
-                    f"""<div class="prod-baja">
-                    <strong>{cat}</strong> — {row['demanda']:.1f} unidades predichas<br>
-                    <span style="font-size:0.9em;color:#86efac;">
-                    Acción: No acumular stock. Imprimir cuando se reciba pedido.
-                    </span></div>""",
-                    unsafe_allow_html=True,
-                )
-
-        # SIN PRODUCCIÓN
-        if len(none) > 0:
-            st.markdown("#### ⚪ Sin señal de demanda")
-            cats_none = ", ".join(none.index.tolist())
-            st.markdown(f"Categorías sin demanda significativa predicha: **{cats_none}**")
-
-        # Resumen visual
-        st.markdown("---")
-        st.markdown("### Resumen de producción")
-
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            st.metric("Categorías prioridad alta", len(alta))
-        with col_b:
-            total_producir = summary["demanda"].sum()
-            st.metric("Unidades totales sugeridas", f"{total_producir:.0f}")
-        with col_c:
-            conf_media = summary["confianza"].mean()
-            st.metric("Confianza promedio", f"{conf_media:.0f}%")
-
-    else:
-        st.info("Ejecuta el entrenamiento para generar recomendaciones.")
-
-
-# ============================================================================
-# TAB 4: MODELOS ML
-# ============================================================================
-with tab_modelos:
-    st.markdown("### Comparación de modelos")
-
-    if "comparacion" in data:
-        comp = data["comparacion"]
-
-        # Tabla de comparación
+    # Tabla de predicciones
+    with st.expander("📋 Tabla de predicciones detallada"):
         st.dataframe(
-            comp[["modelo", "MAE", "MAPE", "R2", "mejora_mae_pct"]].rename(columns={
-                "modelo": "Modelo",
-                "mejora_mae_pct": "Mejora vs Baseline (%)"
-            }),
+            pred_sel[["fecha_prediccion", "unidades_predichas", "banda_inferior", "banda_superior", "dia_horizonte"]].reset_index(drop=True),
             use_container_width=True,
             hide_index=True,
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 2: COMPARACIÓN DE MODELOS
+# ═══════════════════════════════════════════════════════════════════════════
+
+with tab2:
+    st.header("Comparación de Modelos de ML")
+
+    metricas_df, run_info = cargar_metricas()
+
+    if metricas_df.empty:
+        st.warning("No hay métricas. Entrena los modelos primero.")
+    else:
+        # Info del run
+        st.caption(
+            f"Run: `{run_info.get('run_id', '?')}` | "
+            f"Fecha: {run_info.get('fecha_ejecucion', '?')} | "
+            f"Datos: {run_info.get('n_datos', '?')} días"
+        )
+
+        # KPIs del run
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("🏆 Modelo Ganador", run_info.get("modelo_ganador", "?"))
+        with col2:
+            baseline_mape = run_info.get("baseline_mape", 0)
+            st.metric("📌 Baseline MAPE", f"{baseline_mape:.1f}%")
+        with col3:
+            mejora = run_info.get("mejora_pct", 0)
+            color = "normal" if mejora and mejora >= 20 else "off"
+            st.metric(
+                "📈 Mejora vs Baseline",
+                f"{mejora:+.1f}%" if mejora else "N/A",
+                delta="✅ Objetivo ≥20%" if mejora and mejora >= 20 else "⚠️ Debajo del objetivo",
+            )
+
+        st.divider()
 
         # Gráfica de barras comparativa
-        col_mae, col_r2 = st.columns(2)
-
-        with col_mae:
-            fig_mae = go.Figure()
-            colors_bar = ["#6b7280", "#f59e0b", "#3b82f6", "#10b981"]
-            fig_mae.add_trace(go.Bar(
-                x=comp["modelo"],
-                y=comp["MAE"],
-                marker_color=colors_bar[:len(comp)],
-                text=[f"{v:.3f}" for v in comp["MAE"]],
-                textposition="outside",
-            ))
-            fig_mae.update_layout(
-                title="MAE por modelo (menor = mejor)",
-                height=350, margin=dict(l=20, r=20, t=50, b=80),
-                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                yaxis_title="MAE",
-            )
-            fig_mae.update_xaxes(tickangle=20, gridcolor="rgba(128,128,128,0.1)")
-            fig_mae.update_yaxes(gridcolor="rgba(128,128,128,0.1)")
-            st.plotly_chart(fig_mae, use_container_width=True)
-
-        with col_r2:
-            fig_r2 = go.Figure()
-            fig_r2.add_trace(go.Bar(
-                x=comp["modelo"],
-                y=comp["R2"],
-                marker_color=colors_bar[:len(comp)],
-                text=[f"{v:.3f}" for v in comp["R2"]],
-                textposition="outside",
-            ))
-            fig_r2.update_layout(
-                title="R² por modelo (mayor = mejor)",
-                height=350, margin=dict(l=20, r=20, t=50, b=80),
-                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                yaxis_title="R²",
-            )
-            fig_r2.update_xaxes(tickangle=20, gridcolor="rgba(128,128,128,0.1)")
-            fig_r2.update_yaxes(gridcolor="rgba(128,128,128,0.1)")
-            st.plotly_chart(fig_r2, use_container_width=True)
-
-    # Feature importance
-    st.markdown("---")
-    st.markdown("### Importancia de features")
-    st.markdown("¿Qué variables son más predictivas para la demanda?")
-
-    if "importance" in data:
-        imp = data["importance"].sort_values("importance_avg", ascending=True).tail(12)
-
-        fig_imp = go.Figure()
-        fig_imp.add_trace(go.Bar(
-            y=imp["feature"],
-            x=imp["importance_rf"],
-            name="Random Forest",
-            orientation="h",
-            marker_color="#3b82f6",
-        ))
-        fig_imp.add_trace(go.Bar(
-            y=imp["feature"],
-            x=imp["importance_gb"],
-            name="Gradient Boosting",
-            orientation="h",
-            marker_color="#10b981",
-        ))
-        fig_imp.update_layout(
-            barmode="group",
-            height=max(350, len(imp) * 35),
-            margin=dict(l=20, r=20, t=20, b=20),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02),
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-            xaxis_title="Importancia",
-        )
-        fig_imp.update_xaxes(gridcolor="rgba(128,128,128,0.1)")
-        st.plotly_chart(fig_imp, use_container_width=True)
-
-        # Interpretación
-        st.markdown("""
-        **Interpretación de los features principales:**
-        - **cambio_semanal** — Aceleración de demanda. Si las ventas subieron esta semana vs la pasada, el modelo predice que seguirán subiendo.
-        - **lag_1w** — Ventas de la semana anterior. El comportamiento reciente es altamente predictivo.
-        - **ventas_acumuladas** — Popularidad total de la categoría. Categorías con más historial tienden a mantener demanda.
-        - **rolling_mean_2w** — Promedio móvil de 2 semanas. Suaviza ruido y captura tendencia a corto plazo.
-        """)
-
-
-# ============================================================================
-# TAB 5: EXPLORACIÓN DE DATOS
-# ============================================================================
-with tab_datos:
-    st.markdown("### Exploración del dataset")
-
-    if "ventas" in data:
-        v = data["ventas"]
-
-        col_left, col_right = st.columns(2)
-
-        with col_left:
-            # Ventas por mes
-            st.markdown("#### Ventas por mes")
-            monthly = v.groupby(v["fecha"].dt.to_period("M")).size().reset_index()
-            monthly.columns = ["mes", "ventas"]
-            monthly["mes"] = monthly["mes"].astype(str)
-
-            fig_month = go.Figure()
-            fig_month.add_trace(go.Bar(
-                x=monthly["mes"],
-                y=monthly["ventas"],
-                marker_color="#3b82f6",
-                marker_cornerradius=4,
-                text=monthly["ventas"],
-                textposition="outside",
-            ))
-            fig_month.update_layout(
-                height=300, margin=dict(l=20, r=20, t=20, b=40),
-                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                yaxis_title="Unidades",
-            )
-            fig_month.update_xaxes(gridcolor="rgba(128,128,128,0.1)")
-            fig_month.update_yaxes(gridcolor="rgba(128,128,128,0.1)")
-            st.plotly_chart(fig_month, use_container_width=True)
-
-        with col_right:
-            # Distribución por tipo de prenda
-            st.markdown("#### Tipo de prenda")
-            tipo_dist = v["tipo_prenda"].value_counts()
-
-            fig_tipo = go.Figure()
-            fig_tipo.add_trace(go.Pie(
-                labels=tipo_dist.index,
-                values=tipo_dist.values,
-                hole=0.4,
-                marker=dict(colors=COLOR_LIST[:len(tipo_dist)]),
-                textinfo="label+percent",
-                textposition="outside",
-            ))
-            fig_tipo.update_layout(
-                height=300, margin=dict(l=20, r=20, t=20, b=20),
-                showlegend=False,
-                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-            )
-            st.plotly_chart(fig_tipo, use_container_width=True)
-
-        # Mapa de calor: categoría × mes
-        st.markdown("#### Heatmap: categorías por mes")
-        v["mes_str"] = v["fecha"].dt.strftime("%Y-%m")
-        heatmap_data = v.pivot_table(
-            index="categoria",
-            columns="mes_str",
-            values="venta_id",
-            aggfunc="count",
-            fill_value=0,
+        fig_comp = make_subplots(
+            rows=1, cols=3,
+            subplot_titles=["MAE (menor = mejor)", "MAPE % (menor = mejor)", "R² (mayor = mejor)"],
         )
 
-        fig_heat = go.Figure(data=go.Heatmap(
-            z=heatmap_data.values,
-            x=heatmap_data.columns,
-            y=heatmap_data.index,
-            colorscale="Blues",
-            text=heatmap_data.values,
-            texttemplate="%{text}",
-            textfont={"size": 12},
-        ))
-        fig_heat.update_layout(
-            height=max(300, len(heatmap_data) * 30),
-            margin=dict(l=20, r=20, t=20, b=40),
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-        )
-        st.plotly_chart(fig_heat, use_container_width=True)
+        colores = [COLORS["accent"], COLORS["success"], COLORS["warning"], COLORS["danger"]][:len(metricas_df)]
+        es_ganador = metricas_df["es_ganador"].astype(bool) if "es_ganador" in metricas_df.columns else [False] * len(metricas_df)
+        bar_colors = [COLORS["success"] if g else COLORS["gray"] for g in es_ganador]
 
-        # Distribución geográfica
-        st.markdown("#### Top estados por ventas")
-        geo = v["estado_geo"].value_counts().head(10)
-        fig_geo = go.Figure()
-        fig_geo.add_trace(go.Bar(
-            x=geo.values,
-            y=geo.index,
-            orientation="h",
-            marker_color="#8b5cf6",
-            marker_cornerradius=4,
-            text=geo.values,
+        fig_comp.add_trace(go.Bar(
+            x=metricas_df["modelo"], y=metricas_df["mae"],
+            marker_color=bar_colors, name="MAE", showlegend=False,
+            text=metricas_df["mae"].round(2), textposition="outside",
+        ), row=1, col=1)
+
+        fig_comp.add_trace(go.Bar(
+            x=metricas_df["modelo"], y=metricas_df["mape"],
+            marker_color=bar_colors, name="MAPE", showlegend=False,
+            text=metricas_df["mape"].round(1).astype(str) + "%", textposition="outside",
+        ), row=1, col=2)
+
+        fig_comp.add_trace(go.Bar(
+            x=metricas_df["modelo"], y=metricas_df["r2"],
+            marker_color=bar_colors, name="R²", showlegend=False,
+            text=metricas_df["r2"].round(3), textposition="outside",
+        ), row=1, col=3)
+
+        # Agregar línea de baseline al MAPE
+        if baseline_mape:
+            fig_comp.add_hline(
+                y=baseline_mape, line_dash="dash", line_color=COLORS["danger"],
+                annotation_text=f"Baseline: {baseline_mape:.1f}%",
+                row=1, col=2,
+            )
+
+        fig_comp.update_layout(
+            height=400, template="plotly_white",
+            title="Métricas de Desempeño por Modelo",
+        )
+        st.plotly_chart(fig_comp, use_container_width=True)
+
+        # Tabla de métricas
+        st.subheader("Detalle de métricas")
+        display_df = metricas_df[["modelo", "mae", "mape", "r2", "parametros", "es_ganador"]].copy()
+        display_df.columns = ["Modelo", "MAE", "MAPE (%)", "R²", "Parámetros", "Ganador"]
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        # Forecast comparativo (todos los modelos)
+        st.subheader("Forecast comparativo — Todos los modelos")
+        pred = cargar_predicciones()
+        if not pred.empty:
+            pred["fecha_prediccion"] = pd.to_datetime(pred["fecha_prediccion"])
+            fig_all = go.Figure()
+            line_styles = ["solid", "dash", "dot", "dashdot"]
+            for i, (modelo, grupo) in enumerate(pred.groupby("modelo")):
+                es_winner = modelo == run_info.get("modelo_ganador")
+                fig_all.add_trace(go.Scatter(
+                    x=grupo["fecha_prediccion"],
+                    y=grupo["unidades_predichas"],
+                    name=f"{'🏆 ' if es_winner else ''}{modelo}",
+                    mode="lines+markers",
+                    line=dict(
+                        width=3 if es_winner else 1.5,
+                        dash=line_styles[i % len(line_styles)],
+                    ),
+                    marker=dict(size=4 if es_winner else 2),
+                ))
+            fig_all.update_layout(
+                title="Pronóstico de todos los modelos",
+                template="plotly_white",
+                height=400,
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig_all, use_container_width=True)
+
+        # Historial de training runs
+        with st.expander("📜 Historial de entrenamientos"):
+            try:
+                runs = read_sql("SELECT * FROM training_runs ORDER BY fecha_ejecucion DESC LIMIT 20")
+                if not runs.empty:
+                    st.dataframe(runs, use_container_width=True, hide_index=True)
+            except Exception:
+                st.info("Sin historial de entrenamientos.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 3: PRODUCCIÓN DTF
+# ═══════════════════════════════════════════════════════════════════════════
+
+with tab3:
+    st.header("Recomendaciones de Producción DTF")
+
+    pred = cargar_predicciones()
+    serie = cargar_serie()
+    ventas = cargar_ventas()
+
+    if pred.empty:
+        st.warning("Entrena los modelos para ver recomendaciones.")
+    else:
+        pred["fecha_prediccion"] = pd.to_datetime(pred["fecha_prediccion"])
+        serie["fecha"] = pd.to_datetime(serie["fecha"])
+
+        ganador = pred["modelo_ganador"].iloc[0] if "modelo_ganador" in pred.columns else pred["modelo"].iloc[0]
+        pg = pred[pred["modelo"] == ganador]
+
+        # Resumen de producción
+        st.subheader("📦 Plan de producción sugerido — 30 días")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric(
+                "Escenario conservador",
+                f"{pg['banda_inferior'].sum():.0f} uds",
+                help="Banda inferior (−30%)",
+            )
+        with col2:
+            st.metric(
+                "Escenario central",
+                f"{pg['unidades_predichas'].sum():.0f} uds",
+                help="Predicción del modelo ganador",
+            )
+        with col3:
+            st.metric(
+                "Escenario optimista",
+                f"{pg['banda_superior'].sum():.0f} uds",
+                help="Banda superior (+30%)",
+            )
+
+        st.divider()
+
+        # Forecast semanal
+        pg_copy = pg.copy()
+        pg_copy["semana"] = pg_copy["fecha_prediccion"].dt.isocalendar().week.astype(int)
+        semanal = pg_copy.groupby("semana").agg(
+            unidades=("unidades_predichas", "sum"),
+            inferior=("banda_inferior", "sum"),
+            superior=("banda_superior", "sum"),
+        ).reset_index()
+
+        fig_sem = go.Figure()
+        fig_sem.add_trace(go.Bar(
+            x=semanal["semana"].astype(str).apply(lambda x: f"Sem {x}"),
+            y=semanal["unidades"],
+            name="Forecast",
+            marker_color=COLORS["accent"],
+            text=semanal["unidades"].round(0).astype(int),
             textposition="outside",
         ))
-        fig_geo.update_layout(
-            height=350, margin=dict(l=20, r=40, t=20, b=20),
-            xaxis_title="Ventas",
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-        )
-        fig_geo.update_xaxes(gridcolor="rgba(128,128,128,0.1)")
-        st.plotly_chart(fig_geo, use_container_width=True)
-
-        # Tabla de datos crudos
-        st.markdown("#### Datos de ventas")
-        cols_show = ["venta_id", "fecha", "diseno", "categoria", "tipo_prenda",
-                     "ingresos", "total_neto", "estado_geo"]
-        cols_available = [c for c in cols_show if c in v.columns]
-        st.dataframe(
-            v[cols_available].sort_values("fecha", ascending=False),
-            use_container_width=True,
-            hide_index=True,
+        fig_sem.add_trace(go.Scatter(
+            x=semanal["semana"].astype(str).apply(lambda x: f"Sem {x}"),
+            y=semanal["superior"],
+            mode="markers",
+            marker=dict(color=COLORS["success"], size=8, symbol="triangle-up"),
+            name="Optimista (+30%)",
+        ))
+        fig_sem.add_trace(go.Scatter(
+            x=semanal["semana"].astype(str).apply(lambda x: f"Sem {x}"),
+            y=semanal["inferior"],
+            mode="markers",
+            marker=dict(color=COLORS["warning"], size=8, symbol="triangle-down"),
+            name="Conservador (−30%)",
+        ))
+        fig_sem.update_layout(
+            title="Producción sugerida por semana",
+            yaxis_title="Unidades",
+            template="plotly_white",
             height=400,
         )
+        st.plotly_chart(fig_sem, use_container_width=True)
 
+        # Análisis por categoría
+        if not ventas.empty and "categoria" in ventas.columns:
+            st.subheader("🏷️ Rendimiento por categoría")
+            col_a, col_b = st.columns(2)
+
+            cat_vol = ventas.groupby("categoria")["cantidad"].sum().sort_values(ascending=False)
+            cat_ing = ventas.groupby("categoria")["ingreso_bruto"].sum().sort_values(ascending=False)
+
+            with col_a:
+                fig_cat = px.pie(
+                    values=cat_vol.values,
+                    names=cat_vol.index,
+                    title="Distribución por volumen",
+                    hole=0.4,
+                )
+                fig_cat.update_layout(height=350)
+                st.plotly_chart(fig_cat, use_container_width=True)
+
+            with col_b:
+                fig_ing = px.bar(
+                    x=cat_ing.index,
+                    y=cat_ing.values,
+                    title="Ingreso por categoría ($MXN)",
+                    labels={"x": "Categoría", "y": "Ingreso"},
+                    color=cat_ing.values,
+                    color_continuous_scale="Blues",
+                )
+                fig_ing.update_layout(height=350, showlegend=False)
+                st.plotly_chart(fig_ing, use_container_width=True)
+
+        # Recomendaciones textuales
+        st.subheader("💡 Recomendaciones accionables")
+
+        prom_hist = serie["unidades"].mean()
+        prom_pred = pg["unidades_predichas"].mean()
+        cambio = ((prom_pred - prom_hist) / prom_hist * 100) if prom_hist > 0 else 0
+
+        if cambio > 20:
+            st.success(f"📈 **Oportunidad**: La demanda estimada supera el promedio histórico en {cambio:.0f}%. Asegura stock de insumos DTF.")
+        elif cambio < -10:
+            st.warning(f"📉 **Precaución**: La demanda estimada está {abs(cambio):.0f}% debajo del promedio. Reduce tirajes.")
+        else:
+            st.info(f"➡️ La demanda se mantiene estable ({cambio:+.0f}% vs histórico).")
+
+        pg_copy["dia_semana"] = pg_copy["fecha_prediccion"].dt.dayofweek
+        mejor_dia_num = pg_copy.groupby("dia_semana")["unidades_predichas"].mean().idxmax()
+        dias = {0: "Lunes", 1: "Martes", 2: "Miércoles", 3: "Jueves", 4: "Viernes", 5: "Sábado", 6: "Domingo"}
+        st.info(f"📅 **Día más fuerte**: {dias.get(mejor_dia_num, '?')} — considera concentrar lanzamientos y promociones.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 4: GOOGLE TRENDS
+# ═══════════════════════════════════════════════════════════════════════════
+
+with tab4:
+    st.header("Google Trends — Tendencias de diseño")
+    st.caption("Detecta tendencias emergentes para diseños DTF usando Google Trends")
+
+    col1, col2, col3 = st.columns([3, 1, 1])
+    with col1:
+        keywords_input = st.text_input(
+            "Keywords (separadas por coma, max 5)",
+            value="playera personalizada, DTF printing, diseño streetwear",
+            help="Ejemplo: streetwear, anime shirts, custom t-shirt",
+        )
+    with col2:
+        timeframe = st.selectbox(
+            "Período",
+            ["today 1-m", "today 3-m", "today 12-m"],
+            index=1,
+            format_func=lambda x: {"today 1-m": "1 mes", "today 3-m": "3 meses", "today 12-m": "12 meses"}[x],
+        )
+    with col3:
+        geo = st.selectbox("País", ["MX", "US", "CO", "AR", "ES", ""], index=0,
+                           format_func=lambda x: x if x else "Global")
+
+    if st.button("🔍 Buscar tendencias", type="primary"):
+        with st.spinner("Consultando Google Trends..."):
+            try:
+                from pytrends.request import TrendReq
+                kw_list = [k.strip() for k in keywords_input.split(",")][:5]
+
+                pytrends = TrendReq(hl="es-MX", tz=360, timeout=(10, 25))
+                pytrends.build_payload(kw_list, cat=0, timeframe=timeframe, geo=geo)
+
+                interest = pytrends.interest_over_time()
+
+                if interest.empty:
+                    st.warning("Sin datos para estas keywords.")
+                else:
+                    if "isPartial" in interest.columns:
+                        interest = interest.drop("isPartial", axis=1)
+
+                    # Gráfica de tendencias
+                    fig_trends = go.Figure()
+                    for kw in kw_list:
+                        if kw in interest.columns:
+                            fig_trends.add_trace(go.Scatter(
+                                x=interest.index,
+                                y=interest[kw],
+                                name=kw,
+                                mode="lines",
+                            ))
+                    fig_trends.update_layout(
+                        title="Interés en el tiempo — Google Trends",
+                        yaxis_title="Interés relativo (0-100)",
+                        template="plotly_white",
+                        height=400,
+                        hovermode="x unified",
+                    )
+                    st.plotly_chart(fig_trends, use_container_width=True)
+
+                    # Resumen
+                    st.subheader("Resumen de interés")
+                    summary = interest.describe().loc[["mean", "max", "min"]].round(1)
+                    st.dataframe(summary, use_container_width=True)
+
+                    # Related queries
+                    try:
+                        related = pytrends.related_queries()
+                        for kw in kw_list:
+                            if kw in related and related[kw]["top"] is not None:
+                                with st.expander(f"🔗 Búsquedas relacionadas: {kw}"):
+                                    st.dataframe(related[kw]["top"].head(10), use_container_width=True, hide_index=True)
+                    except Exception:
+                        pass
+
+            except ImportError:
+                st.error("pytrends no está instalado. Ejecuta: `pip install pytrends`")
+            except Exception as e:
+                st.error(f"Error al consultar Google Trends: {e}")
+
+    # Estacionalidad H&M como fallback visual
+    st.divider()
+    st.subheader("📅 Patrones estacionales H&M (referencia)")
+
+    factores = cargar_factores_hm()
+    if not factores.empty:
+        col_a, col_b = st.columns(2)
+
+        semanal = factores[factores["tipo"] == "semanal"].copy()
+        mensual = factores[factores["tipo"] == "mensual"].copy()
+
+        if not semanal.empty:
+            semanal["dia"] = semanal["clave"].astype(int)
+            dias_map = {0: "Lun", 1: "Mar", 2: "Mié", 3: "Jue", 4: "Vie", 5: "Sáb", 6: "Dom"}
+            semanal["nombre"] = semanal["dia"].map(dias_map)
+            semanal = semanal.sort_values("dia")
+
+            with col_a:
+                fig_sw = px.bar(
+                    semanal, x="nombre", y="valor",
+                    title="Índice semanal H&M",
+                    labels={"valor": "Índice", "nombre": "Día"},
+                    color="valor", color_continuous_scale="Blues",
+                )
+                fig_sw.add_hline(y=1.0, line_dash="dash", line_color="gray")
+                fig_sw.update_layout(height=350, showlegend=False)
+                st.plotly_chart(fig_sw, use_container_width=True)
+
+        if not mensual.empty:
+            mensual["mes_num"] = mensual["clave"].astype(int)
+            meses_map = {1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
+                         7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic"}
+            mensual["nombre"] = mensual["mes_num"].map(meses_map)
+            mensual = mensual.sort_values("mes_num")
+
+            with col_b:
+                fig_mm = px.bar(
+                    mensual, x="nombre", y="valor",
+                    title="Índice mensual H&M",
+                    labels={"valor": "Índice", "nombre": "Mes"},
+                    color="valor", color_continuous_scale="Greens",
+                )
+                fig_mm.add_hline(y=1.0, line_dash="dash", line_color="gray")
+                fig_mm.update_layout(height=350, showlegend=False)
+                st.plotly_chart(fig_mm, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 5: DATOS
+# ═══════════════════════════════════════════════════════════════════════════
+
+with tab5:
+    st.header("Exploración de Datos")
+
+    serie = cargar_serie()
+    ventas = cargar_ventas()
+
+    if serie.empty:
+        st.warning("No hay datos cargados. Sube un archivo Excel/CSV desde la barra lateral.")
     else:
-        st.info("Datos de ventas no disponibles.")
+        serie["fecha"] = pd.to_datetime(serie["fecha"])
 
+        # KPIs generales
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total unidades", f"{serie['unidades'].sum():.0f}")
+        with col2:
+            total_ingreso = serie["ingreso_bruto"].sum()
+            st.metric("Ingreso bruto", f"${total_ingreso:,.0f} MXN")
+        with col3:
+            dias_activos = (serie["unidades"] > 0).sum()
+            st.metric("Días con ventas", f"{dias_activos} de {len(serie)}")
+        with col4:
+            if not ventas.empty and "producto" in ventas.columns:
+                n_productos = ventas["producto"].nunique()
+                st.metric("Productos únicos", n_productos)
 
-# ============================================================================
-# FOOTER
-# ============================================================================
-st.markdown("---")
-st.markdown(
-    "<div style='text-align:center;color:#6b7280;font-size:0.8rem;'>"
-    "Plataforma Predictiva DTF · Proyecto de Titulación 2026 · "
-    "Metodología APQP · Python + FastAPI + Streamlit"
-    "</div>",
-    unsafe_allow_html=True,
-)
+        st.divider()
+
+        # Gráfica de ventas diarias + ingreso acumulado
+        fig_hist = make_subplots(
+            rows=2, cols=1,
+            subplot_titles=["Ventas diarias", "Ingreso acumulado ($MXN)"],
+            shared_xaxes=True,
+            vertical_spacing=0.12,
+            row_heights=[0.6, 0.4],
+        )
+
+        fig_hist.add_trace(go.Bar(
+            x=serie["fecha"], y=serie["unidades"],
+            name="Unidades", marker_color=COLORS["accent"], opacity=0.7,
+        ), row=1, col=1)
+
+        if "ingreso_acumulado" in serie.columns:
+            fig_hist.add_trace(go.Scatter(
+                x=serie["fecha"], y=serie["ingreso_acumulado"],
+                name="Ingreso acumulado", fill="tozeroy",
+                line=dict(color=COLORS["success"]),
+            ), row=2, col=1)
+
+        fig_hist.update_layout(height=600, template="plotly_white", showlegend=True)
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+        # Distribución por día de la semana
+        col_a, col_b = st.columns(2)
+        with col_a:
+            por_dia = serie.groupby("dia_semana")["unidades"].mean()
+            dias_map = {0: "Lun", 1: "Mar", 2: "Mié", 3: "Jue", 4: "Vie", 5: "Sáb", 6: "Dom"}
+            fig_dia = px.bar(
+                x=[dias_map.get(d, d) for d in por_dia.index],
+                y=por_dia.values,
+                title="Promedio de ventas por día",
+                labels={"x": "Día", "y": "Unidades promedio"},
+                color=por_dia.values,
+                color_continuous_scale="Blues",
+            )
+            fig_dia.update_layout(height=350, showlegend=False)
+            st.plotly_chart(fig_dia, use_container_width=True)
+
+        with col_b:
+            por_mes = serie.groupby("mes")["unidades"].mean()
+            meses_map = {1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
+                         7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic"}
+            fig_mes = px.bar(
+                x=[meses_map.get(m, m) for m in por_mes.index],
+                y=por_mes.values,
+                title="Promedio de ventas por mes",
+                labels={"x": "Mes", "y": "Unidades promedio"},
+                color=por_mes.values,
+                color_continuous_scale="Greens",
+            )
+            fig_mes.update_layout(height=350, showlegend=False)
+            st.plotly_chart(fig_mes, use_container_width=True)
+
+        # Tabla de datos raw
+        with st.expander("📋 Datos crudos — Serie temporal completa"):
+            st.dataframe(
+                serie.sort_values("fecha", ascending=False).reset_index(drop=True),
+                use_container_width=True,
+                hide_index=True,
+                height=400,
+            )
+
+        if not ventas.empty:
+            with st.expander("📋 Datos crudos — Transacciones individuales"):
+                st.dataframe(
+                    ventas.sort_values("fecha", ascending=False).reset_index(drop=True),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=400,
+                )
+
+        # Descarga
+        st.divider()
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            csv_serie = serie.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Descargar serie temporal (CSV)",
+                csv_serie,
+                "dtf_serie_temporal.csv",
+                "text/csv",
+            )
+        with col_d2:
+            if not ventas.empty:
+                csv_ventas = ventas.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "⬇️ Descargar ventas (CSV)",
+                    csv_ventas,
+                    "dtf_ventas.csv",
+                    "text/csv",
+                )

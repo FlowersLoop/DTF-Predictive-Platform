@@ -1,61 +1,40 @@
 """
-============================================================================
-API Backend — Plataforma Predictiva DTF
-============================================================================
-FastAPI REST API que expone los modelos de forecasting para consumo
-del dashboard y sistemas externos.
-
-Endpoints:
-  GET  /                        → Health check
-  GET  /predict/{categoria}     → Pronóstico por categoría
-  GET  /predict                 → Pronóstico de todas las categorías
-  GET  /trends                  → Ranking de categorías por demanda predicha
-  GET  /metrics                 → Métricas de los modelos
-  GET  /features                → Feature importance
-  GET  /recommendations         → Recomendaciones de producción DTF
-  GET  /history/{categoria}     → Historial de ventas de una categoría
-  POST /train                   → Re-entrenar modelos con datos actualizados
-
-Ejecución:
-  uvicorn main:app --reload --port 8000
-
-============================================================================
+FastAPI Backend v4.0 — DTF Fashion Predictive Analytics Platform
+Endpoints para predicciones, métricas, tendencias, recomendaciones.
+Lee/escribe PostgreSQL.
 """
 
-from fastapi import FastAPI, HTTPException, Query
+import os
+import sys
+import shutil
+import tempfile
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from typing import Optional
-import pandas as pd
-import numpy as np
-import pickle
-import json
-import subprocess
-from pathlib import Path
-from datetime import datetime
 
-# ============================================================================
-# CONFIGURACIÓN
-# ============================================================================
-BASE_DIR = Path(__file__).parent.parent
-DATA_DIR = BASE_DIR / "data" / "processed"
-MODEL_DIR = BASE_DIR / "models" / "saved"
-ETL_SCRIPT = BASE_DIR / "etl" / "etl_pipeline.py"
-TRAIN_SCRIPT = BASE_DIR / "models" / "train_models.py"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from database.connection import read_sql, engine
 
-# ============================================================================
-# APP FASTAPI
-# ============================================================================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("api")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# APP
+# ═══════════════════════════════════════════════════════════════════════════
+
 app = FastAPI(
-    title="DTF Predictive Platform API",
-    description=(
-        "API de análisis predictivo para marcas de moda con producción DTF. "
-        "Expone pronósticos de demanda por categoría, rankings de tendencias, "
-        "recomendaciones de producción y métricas de modelos ML."
-    ),
-    version="1.0.0",
-    contact={"name": "DTF Predictive Team"},
+    title="DTF Fashion — Predictive Analytics API",
+    description="API de análisis predictivo con IA para marcas de moda DTF",
+    version="4.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
 )
 
 app.add_middleware(
@@ -67,472 +46,561 @@ app.add_middleware(
 )
 
 
-# ============================================================================
-# CARGA DE DATOS Y MODELOS
-# ============================================================================
-def load_model(name: str):
-    """Carga un modelo serializado desde disco."""
-    path = MODEL_DIR / f"{name}.pkl"
-    if not path.exists():
-        return None
-    with open(path, "rb") as f:
-        return pickle.load(f)
+# ═══════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def safe_read(query: str) -> pd.DataFrame:
+    """Lee de PostgreSQL con manejo de errores."""
+    try:
+        return read_sql(query)
+    except Exception as e:
+        log.error(f"Error DB: {e}")
+        raise HTTPException(status_code=500, detail=f"Error de base de datos: {str(e)}")
 
 
-def load_csv(name: str) -> Optional[pd.DataFrame]:
-    """Carga un CSV de datos procesados."""
-    path = DATA_DIR / name
-    if not path.exists():
-        return None
-    return pd.read_csv(path)
+def df_to_records(df: pd.DataFrame) -> list:
+    """Convierte DataFrame a lista de dicts serializables."""
+    df = df.copy()
+    for col in df.select_dtypes(include=["datetime64", "datetimetz"]).columns:
+        df[col] = df[col].astype(str)
+    return df.where(df.notna(), None).to_dict(orient="records")
 
 
-def load_json(name: str) -> Optional[dict]:
-    """Carga un JSON de metadata o reportes."""
-    for directory in [MODEL_DIR, DATA_DIR]:
-        path = directory / name
-        if path.exists():
-            with open(path) as f:
-                return json.load(f)
-    return None
-
-
-# ============================================================================
-# SCHEMAS PYDANTIC
-# ============================================================================
-class PredictionResponse(BaseModel):
-    categoria: str
-    semana: str
-    prediccion_unidades: float
-    confianza: float
-    modelo_principal: str
-    pred_random_forest: float
-    pred_gradient_boosting: float
-    pred_seasonal: float
-    recomendacion: str
-
-
-class TrendItem(BaseModel):
-    categoria: str
-    demanda_predicha: float
-    tendencia: str  # "subiendo", "estable", "bajando"
-    confianza_media: float
-    recomendacion: str
-
-
-class MetricsResponse(BaseModel):
-    modelo: str
-    MAE: float
-    MAPE: float
-    R2: float
-    mejora_vs_baseline: str
-
-
-class TrainResponse(BaseModel):
-    status: str
-    mensaje: str
-    timestamp: str
-    metricas: Optional[dict] = None
-
-
-# ============================================================================
+# ═══════════════════════════════════════════════════════════════════════════
 # ENDPOINTS
-# ============================================================================
+# ═══════════════════════════════════════════════════════════════════════════
 
-@app.get("/", tags=["health"])
-def health_check():
-    """Health check — verifica que la API está corriendo y los datos están cargados."""
-    predictions = load_csv("predicciones_completas.csv")
-    report = load_json("training_report.json")
-
+@app.get("/")
+def root():
     return {
-        "status": "online",
-        "proyecto": "Plataforma Predictiva DTF",
-        "version": "1.0.0",
-        "timestamp": datetime.now().isoformat(),
-        "datos_cargados": predictions is not None,
-        "modelos_disponibles": report is not None,
+        "nombre": "DTF Fashion Predictive Analytics API",
+        "version": "4.0.0",
         "endpoints": [
-            "GET /predict/{categoria}",
-            "GET /predict",
-            "GET /trends",
-            "GET /metrics",
-            "GET /features",
-            "GET /recommendations",
-            "GET /history/{categoria}",
-            "POST /train",
+            "/predict", "/metrics", "/trends", "/trends/live",
+            "/recommendations", "/seasonality", "/history",
+            "POST /upload", "POST /train",
         ],
     }
 
 
-@app.get("/predict/{categoria}", response_model=list[PredictionResponse], tags=["predicciones"])
-def predict_categoria(categoria: str):
-    """
-    Pronóstico de demanda para una categoría específica.
-    Devuelve predicciones semanales con intervalos de confianza.
-    """
-    df = load_csv("predicciones_completas.csv")
-    if df is None:
-        raise HTTPException(status_code=503, detail="Predicciones no disponibles. Ejecutar POST /train primero.")
-
-    categorias_disponibles = df["categoria"].unique().tolist()
-    cat_match = None
-    for c in categorias_disponibles:
-        if c.lower() == categoria.lower():
-            cat_match = c
-            break
-
-    if cat_match is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Categoría '{categoria}' no encontrada. Disponibles: {categorias_disponibles}"
-        )
-
-    cat_df = df[df["categoria"] == cat_match].sort_values("semana_inicio")
-
-    results = []
-    for _, row in cat_df.iterrows():
-        results.append(PredictionResponse(
-            categoria=cat_match,
-            semana=str(row["semana_inicio"]),
-            prediccion_unidades=round(float(row["pred_ensemble"]), 2),
-            confianza=round(float(row.get("confianza", 50)), 1),
-            modelo_principal="Gradient Boosting (XGBoost)",
-            pred_random_forest=round(float(row["pred_rf"]), 2),
-            pred_gradient_boosting=round(float(row["pred_gb"]), 2),
-            pred_seasonal=round(float(row["sarima_pred"]), 2),
-            recomendacion=str(row.get("recomendacion", "SIN_DATO")),
-        ))
-
-    return results
+@app.get("/health")
+def health():
+    try:
+        df = read_sql("SELECT 1 AS ok")
+        db_ok = True
+    except Exception:
+        db_ok = False
+    return {"status": "ok" if db_ok else "degraded", "db": db_ok, "timestamp": str(datetime.now())}
 
 
-@app.get("/predict", response_model=list[PredictionResponse], tags=["predicciones"])
-def predict_all(
-    top: int = Query(default=50, ge=1, le=200, description="Número máximo de resultados"),
+# ─── PREDICT ──────────────────────────────────────────────────────────────
+
+@app.get("/predict")
+def predict(
+    modelo: Optional[str] = Query(None, description="Filtrar por modelo (SARIMA, Prophet, Random Forest, Transferencia H&M)"),
+    dias: Optional[int] = Query(None, ge=1, le=90, description="Limitar horizonte"),
 ):
     """
-    Pronóstico de demanda para todas las categorías.
-    Ordenado por predicción de demanda descendente.
+    Retorna las predicciones del último training run.
+    Incluye bandas de incertidumbre ±30%.
     """
-    df = load_csv("predicciones_completas.csv")
-    if df is None:
-        raise HTTPException(status_code=503, detail="Predicciones no disponibles.")
+    where = ""
+    params = {}
+    if modelo:
+        where = " AND p.modelo = :modelo"
+        params["modelo"] = modelo
 
-    df = df.sort_values("pred_ensemble", ascending=False).head(top)
-
-    results = []
-    for _, row in df.iterrows():
-        results.append(PredictionResponse(
-            categoria=str(row["categoria"]),
-            semana=str(row["semana_inicio"]),
-            prediccion_unidades=round(float(row["pred_ensemble"]), 2),
-            confianza=round(float(row.get("confianza", 50)), 1),
-            modelo_principal="Gradient Boosting (XGBoost)",
-            pred_random_forest=round(float(row["pred_rf"]), 2),
-            pred_gradient_boosting=round(float(row["pred_gb"]), 2),
-            pred_seasonal=round(float(row["sarima_pred"]), 2),
-            recomendacion=str(row.get("recomendacion", "SIN_DATO")),
-        ))
-
-    return results
-
-
-@app.get("/trends", response_model=list[TrendItem], tags=["tendencias"])
-def get_trends():
+    query = f"""
+        SELECT p.*, t.modelo_ganador, t.mejora_pct
+        FROM predicciones p
+        LEFT JOIN training_runs t ON p.run_id = t.run_id
+        WHERE 1=1 {where}
+        ORDER BY p.modelo, p.fecha_prediccion
     """
-    Ranking de categorías por demanda predicha.
-    Incluye dirección de tendencia (subiendo/bajando/estable).
-    """
-    pred_df = load_csv("predicciones_completas.csv")
-    serie_df = load_csv("serie_semanal.csv")
 
-    if pred_df is None:
-        raise HTTPException(status_code=503, detail="Predicciones no disponibles.")
+    df = safe_read(query)
+    if df.empty:
+        raise HTTPException(status_code=404, detail="No hay predicciones. Ejecuta POST /train primero.")
 
-    ranking = pred_df.groupby("categoria").agg(
-        demanda_total=("pred_ensemble", "sum"),
-        confianza_media=("confianza", "mean"),
-    ).sort_values("demanda_total", ascending=False)
+    if dias:
+        df = df[df["dia_horizonte"] <= dias]
 
-    results = []
-    for cat, row in ranking.iterrows():
-        # Calcular tendencia comparando últimas semanas del historial
-        tendencia = "estable"
-        if serie_df is not None:
-            cat_hist = serie_df[serie_df["categoria"] == cat].sort_values("semana_inicio")
-            if len(cat_hist) >= 4:
-                recent = cat_hist["unidades"].tail(4).values
-                first_half = recent[:2].mean()
-                second_half = recent[2:].mean()
-                if second_half > first_half * 1.2:
-                    tendencia = "subiendo"
-                elif second_half < first_half * 0.8:
-                    tendencia = "bajando"
+    # Agrupar por modelo
+    modelos = {}
+    for nombre, grupo in df.groupby("modelo"):
+        modelos[nombre] = {
+            "predicciones": df_to_records(grupo),
+            "total_unidades": round(grupo["unidades_predichas"].sum(), 1),
+            "promedio_diario": round(grupo["unidades_predichas"].mean(), 2),
+            "rango": {
+                "inferior": round(grupo["banda_inferior"].sum(), 1),
+                "superior": round(grupo["banda_superior"].sum(), 1),
+            },
+        }
 
-        # Recomendación basada en demanda predicha
-        d = row["demanda_total"]
-        if d >= 4:
-            reco = "PRODUCIR_ALTO — Preparar stock inmediato"
-        elif d >= 2:
-            reco = "PRODUCIR_MEDIO — Lote moderado"
-        elif d >= 0.5:
-            reco = "PRODUCIR_BAJO — Impresión bajo demanda"
-        else:
-            reco = "MONITOREAR — Sin señal fuerte"
-
-        results.append(TrendItem(
-            categoria=str(cat),
-            demanda_predicha=round(float(d), 2),
-            tendencia=tendencia,
-            confianza_media=round(float(row["confianza_media"]), 1),
-            recomendacion=reco,
-        ))
-
-    return results
-
-
-@app.get("/metrics", response_model=list[MetricsResponse], tags=["modelos"])
-def get_metrics():
-    """
-    Métricas de evaluación de todos los modelos entrenados.
-    Incluye MAE, MAPE, R² y mejora porcentual vs baseline.
-    """
-    df = load_csv("comparacion_modelos.csv")
-    if df is None:
-        raise HTTPException(status_code=503, detail="Métricas no disponibles.")
-
-    results = []
-    for _, row in df.iterrows():
-        mejora = row.get("mejora_mae_pct", 0)
-        results.append(MetricsResponse(
-            modelo=str(row["modelo"]),
-            MAE=round(float(row["MAE"]), 4),
-            MAPE=round(float(row["MAPE"]), 2),
-            R2=round(float(row["R2"]), 4),
-            mejora_vs_baseline=f"{mejora:+.1f}%" if mejora != 0 else "baseline",
-        ))
-
-    return results
-
-
-@app.get("/features", tags=["modelos"])
-def get_feature_importance(top: int = Query(default=15, ge=1, le=30)):
-    """
-    Feature importance combinada de Random Forest y Gradient Boosting.
-    Muestra qué variables son más predictivas para la demanda.
-    """
-    df = load_csv("feature_importance.csv")
-    if df is None:
-        raise HTTPException(status_code=503, detail="Feature importance no disponible.")
-
-    df = df.sort_values("importance_avg", ascending=False).head(top)
+    ganador = df["modelo_ganador"].iloc[0] if "modelo_ganador" in df.columns and df["modelo_ganador"].notna().any() else None
+    mejora = df["mejora_pct"].iloc[0] if "mejora_pct" in df.columns and df["mejora_pct"].notna().any() else None
 
     return {
-        "top_features": [
-            {
-                "feature": str(row["feature"]),
-                "importance_random_forest": round(float(row["importance_rf"]), 4),
-                "importance_gradient_boosting": round(float(row["importance_gb"]), 4),
-                "importance_promedio": round(float(row["importance_avg"]), 4),
-            }
-            for _, row in df.iterrows()
-        ],
-        "interpretacion": {
-            "cambio_semanal": "Aceleración de demanda — el predictor más fuerte",
-            "lag_1w": "Ventas de la semana pasada — comportamiento reciente",
-            "ventas_acumuladas": "Popularidad acumulada de la categoría",
-            "rolling_mean_2w": "Promedio móvil de 2 semanas — tendencia a corto plazo",
-        },
+        "modelo_ganador": ganador,
+        "mejora_vs_baseline_pct": mejora,
+        "horizonte_dias": dias or df["dia_horizonte"].max(),
+        "modelos": modelos,
     }
 
 
-@app.get("/recommendations", tags=["producción"])
-def get_recommendations():
+# ─── METRICS ──────────────────────────────────────────────────────────────
+
+@app.get("/metrics")
+def metrics():
     """
-    Recomendaciones de producción DTF basadas en las predicciones.
-    Responde: ¿qué imprimir, cuánto y cuándo?
+    Retorna métricas de todos los modelos del último training run,
+    incluyendo baseline naive y comparación.
     """
-    pred_df = load_csv("predicciones_completas.csv")
-    if pred_df is None:
-        raise HTTPException(status_code=503, detail="Predicciones no disponibles.")
+    # Último run
+    runs = safe_read("SELECT * FROM training_runs ORDER BY fecha_ejecucion DESC LIMIT 1")
+    if runs.empty:
+        raise HTTPException(status_code=404, detail="No hay entrenamientos registrados.")
 
-    # Agrupar por categoría
-    summary = pred_df.groupby("categoria").agg(
-        demanda_total=("pred_ensemble", "sum"),
-        demanda_maxima_semana=("pred_ensemble", "max"),
-        confianza_media=("confianza", "mean"),
-        semana_pico=("pred_ensemble", "idxmax"),
-    ).sort_values("demanda_total", ascending=False)
+    run = runs.iloc[0]
+    run_id = run["run_id"]
 
-    recommendations = []
-    for cat, row in summary.iterrows():
-        d = row["demanda_total"]
-        pico_idx = int(row["semana_pico"])
-        semana_pico = pred_df.loc[pico_idx, "semana_inicio"] if pico_idx in pred_df.index else "N/A"
+    # Métricas por modelo
+    metricas = safe_read(f"SELECT * FROM metricas_modelos WHERE run_id = '{run_id}' ORDER BY mape")
 
-        if d >= 4:
-            prioridad = "ALTA"
-            accion = f"Producir {int(np.ceil(d))}+ unidades. Imprimir antes de {semana_pico}."
-            urgencia = "INMEDIATA"
-        elif d >= 2:
-            prioridad = "MEDIA"
-            accion = f"Preparar {int(np.ceil(d))} unidades. Monitorear tendencia."
-            urgencia = "ESTA SEMANA"
-        elif d >= 0.5:
-            prioridad = "BAJA"
-            accion = "Impresión bajo demanda. No acumular stock."
-            urgencia = "CUANDO SE PIDA"
-        else:
-            prioridad = "NINGUNA"
-            accion = "No producir. Sin señal de demanda."
-            urgencia = "N/A"
+    return {
+        "run_id": run_id,
+        "fecha_ejecucion": str(run["fecha_ejecucion"]),
+        "modelo_ganador": run["modelo_ganador"],
+        "n_datos": int(run["n_datos"]) if pd.notna(run["n_datos"]) else None,
+        "baseline": {
+            "mae": float(run["baseline_mae"]) if pd.notna(run["baseline_mae"]) else None,
+            "mape": float(run["baseline_mape"]) if pd.notna(run["baseline_mape"]) else None,
+        },
+        "mejora_pct": float(run["mejora_pct"]) if pd.notna(run["mejora_pct"]) else None,
+        "modelos": df_to_records(metricas),
+    }
 
-        recommendations.append({
-            "categoria": str(cat),
-            "prioridad": prioridad,
-            "urgencia": urgencia,
-            "accion": accion,
-            "demanda_predicha_unidades": round(float(d), 1),
-            "confianza": round(float(row["confianza_media"]), 1),
-            "semana_pico_demanda": str(semana_pico),
+
+# ─── TRENDS (datos de Google Trends desde DB) ────────────────────────────
+
+@app.get("/trends")
+def trends():
+    """
+    Retorna análisis de tendencias basado en patrones estacionales
+    detectados en los datos y los índices H&M.
+    """
+    factores = safe_read("SELECT * FROM factores_hm ORDER BY tipo, clave")
+    if factores.empty:
+        raise HTTPException(status_code=404, detail="No hay factores H&M. Ejecuta el ETL primero.")
+
+    # Organizar por tipo
+    resultado = {}
+    for tipo, grupo in factores.groupby("tipo"):
+        resultado[tipo] = {
+            row["clave"]: {
+                "valor": float(row["valor"]),
+                "descripcion": row.get("descripcion", ""),
+            }
+            for _, row in grupo.iterrows()
+        }
+
+    # Agregar insights
+    serie = safe_read("SELECT * FROM serie_semanal ORDER BY fecha")
+    insights = {}
+    if not serie.empty:
+        serie["fecha"] = pd.to_datetime(serie["fecha"])
+        # Día más fuerte
+        por_dia = serie.groupby("dia_semana")["unidades"].mean()
+        mejor_dia = por_dia.idxmax()
+        dias_nombre = {0: "Lunes", 1: "Martes", 2: "Miércoles", 3: "Jueves", 4: "Viernes", 5: "Sábado", 6: "Domingo"}
+        insights["mejor_dia"] = {"dia": dias_nombre.get(mejor_dia, str(mejor_dia)), "promedio": round(por_dia.max(), 2)}
+
+        # Mes más fuerte
+        por_mes = serie.groupby("mes")["unidades"].mean()
+        if por_mes.sum() > 0:
+            mejor_mes = por_mes.idxmax()
+            meses_nombre = {1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio",
+                            7: "Julio", 8: "Agosto", 9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"}
+            insights["mejor_mes"] = {"mes": meses_nombre.get(mejor_mes, str(mejor_mes)), "promedio": round(por_mes.max(), 2)}
+
+        # Tendencia reciente (últimos 30 días vs 30 anteriores)
+        if len(serie) >= 60:
+            reciente = serie.tail(30)["unidades"].mean()
+            anterior = serie.iloc[-60:-30]["unidades"].mean()
+            cambio = ((reciente - anterior) / anterior * 100) if anterior > 0 else 0
+            insights["tendencia_30d"] = {"cambio_pct": round(cambio, 1), "direccion": "alza" if cambio > 0 else "baja"}
+
+    return {
+        "factores_estacionales": resultado,
+        "insights": insights,
+    }
+
+
+# ─── TRENDS LIVE (Google Trends via pytrends) ────────────────────────────
+
+@app.get("/trends/live")
+def trends_live(
+    keywords: str = Query(..., description="Keywords separados por coma (max 5)"),
+    timeframe: str = Query("today 3-m", description="Timeframe: today 1-m, today 3-m, today 12-m"),
+    geo: str = Query("MX", description="Código de país (MX, US, etc.)"),
+):
+    """
+    Consulta Google Trends en tiempo real para las keywords dadas.
+    Útil para detectar tendencias emergentes de diseños.
+    """
+    try:
+        from pytrends.request import TrendReq
+    except ImportError:
+        raise HTTPException(status_code=501, detail="pytrends no instalado. pip install pytrends")
+
+    kw_list = [k.strip() for k in keywords.split(",")][:5]
+    if not kw_list:
+        raise HTTPException(status_code=400, detail="Proporciona al menos una keyword")
+
+    try:
+        pytrends = TrendReq(hl="es-MX", tz=360, timeout=(10, 25))
+        pytrends.build_payload(kw_list, cat=0, timeframe=timeframe, geo=geo)
+
+        # Interés en el tiempo
+        interest = pytrends.interest_over_time()
+        if interest.empty:
+            return {"keywords": kw_list, "data": [], "mensaje": "Sin datos para estas keywords"}
+
+        # Limpiar columna isPartial
+        if "isPartial" in interest.columns:
+            interest = interest.drop("isPartial", axis=1)
+
+        interest = interest.reset_index()
+        interest["date"] = interest["date"].astype(str)
+
+        # Related queries
+        related = {}
+        try:
+            related_queries = pytrends.related_queries()
+            for kw in kw_list:
+                if kw in related_queries and related_queries[kw]["top"] is not None:
+                    top = related_queries[kw]["top"].head(5)
+                    related[kw] = top.to_dict(orient="records")
+        except Exception:
+            pass
+
+        return {
+            "keywords": kw_list,
+            "geo": geo,
+            "timeframe": timeframe,
+            "interest_over_time": interest.to_dict(orient="records"),
+            "related_queries": related,
+        }
+
+    except Exception as e:
+        log.error(f"Error Google Trends: {e}")
+        raise HTTPException(status_code=502, detail=f"Error consultando Google Trends: {str(e)}")
+
+
+# ─── RECOMMENDATIONS ─────────────────────────────────────────────────────
+
+@app.get("/recommendations")
+def recommendations():
+    """
+    Genera recomendaciones accionables de producción DTF
+    basadas en las predicciones y patrones detectados.
+    """
+    # Leer predicciones del ganador
+    runs = safe_read("SELECT * FROM training_runs ORDER BY fecha_ejecucion DESC LIMIT 1")
+    if runs.empty:
+        raise HTTPException(status_code=404, detail="No hay entrenamientos. Ejecuta POST /train.")
+
+    ganador = runs.iloc[0]["modelo_ganador"]
+    run_id = runs.iloc[0]["run_id"]
+
+    pred = safe_read(f"""
+        SELECT * FROM predicciones
+        WHERE run_id = '{run_id}' AND modelo = '{ganador}'
+        ORDER BY fecha_prediccion
+    """)
+
+    serie = safe_read("SELECT * FROM serie_semanal ORDER BY fecha")
+
+    if pred.empty or serie.empty:
+        raise HTTPException(status_code=404, detail="Datos insuficientes para recomendaciones.")
+
+    pred["fecha_prediccion"] = pd.to_datetime(pred["fecha_prediccion"])
+    serie["fecha"] = pd.to_datetime(serie["fecha"])
+
+    # Análisis de ventas históricas por categoría
+    ventas = safe_read("SELECT * FROM ventas")
+    cat_analysis = {}
+    if not ventas.empty and "categoria" in ventas.columns:
+        cat_summary = ventas.groupby("categoria").agg(
+            unidades=("cantidad", "sum"),
+            ingreso=("ingreso_bruto", "sum"),
+        ).sort_values("unidades", ascending=False)
+        cat_analysis = cat_summary.to_dict(orient="index")
+
+    # Generar recomendaciones
+    total_pred = pred["unidades_predichas"].sum()
+    prom_pred = pred["unidades_predichas"].mean()
+    prom_historico = serie["unidades"].mean()
+    cambio = ((prom_pred - prom_historico) / prom_historico * 100) if prom_historico > 0 else 0
+
+    # Semanas del forecast
+    pred["semana"] = pred["fecha_prediccion"].dt.isocalendar().week.astype(int)
+    por_semana = pred.groupby("semana")["unidades_predichas"].sum()
+    semana_pico = por_semana.idxmax()
+    semana_baja = por_semana.idxmin()
+
+    recomendaciones = []
+
+    # 1. Volumen de producción
+    recomendaciones.append({
+        "tipo": "produccion",
+        "prioridad": "alta",
+        "titulo": "Volumen de producción sugerido",
+        "detalle": (
+            f"Prepara entre {pred['banda_inferior'].sum():.0f} y {pred['banda_superior'].sum():.0f} "
+            f"unidades para los próximos 30 días (escenario central: {total_pred:.0f} uds)."
+        ),
+        "metrica": f"Cambio vs histórico: {cambio:+.1f}%",
+    })
+
+    # 2. Semana pico
+    recomendaciones.append({
+        "tipo": "timing",
+        "prioridad": "alta",
+        "titulo": f"Semana de mayor demanda: Semana {semana_pico}",
+        "detalle": (
+            f"Se estiman {por_semana[semana_pico]:.0f} unidades en la semana {semana_pico}. "
+            f"Asegura inventario y capacidad de impresión DTF antes de esta semana."
+        ),
+    })
+
+    # 3. Días fuertes
+    pred["dia_semana"] = pred["fecha_prediccion"].dt.dayofweek
+    por_dia = pred.groupby("dia_semana")["unidades_predichas"].mean()
+    mejor_dia = por_dia.idxmax()
+    dias_nombre = {0: "Lunes", 1: "Martes", 2: "Miércoles", 3: "Jueves", 4: "Viernes", 5: "Sábado", 6: "Domingo"}
+    recomendaciones.append({
+        "tipo": "operacion",
+        "prioridad": "media",
+        "titulo": f"Día más fuerte: {dias_nombre.get(mejor_dia, mejor_dia)}",
+        "detalle": (
+            f"El {dias_nombre.get(mejor_dia, mejor_dia)} tiene el mayor promedio esperado "
+            f"({por_dia[mejor_dia]:.1f} uds). Considera concentrar lanzamientos y promociones este día."
+        ),
+    })
+
+    # 4. Categorías top (si hay datos)
+    if cat_analysis:
+        top_cat = list(cat_analysis.keys())[:3]
+        recomendaciones.append({
+            "tipo": "producto",
+            "prioridad": "media",
+            "titulo": "Categorías prioritarias",
+            "detalle": (
+                f"Las categorías con mayor tracción son: {', '.join(top_cat)}. "
+                f"Prioriza diseños DTF en estas líneas para los próximos 30 días."
+            ),
+        })
+
+    # 5. Alerta de sobreproducción
+    if cambio < -10:
+        recomendaciones.append({
+            "tipo": "alerta",
+            "prioridad": "alta",
+            "titulo": "Riesgo de sobreproducción",
+            "detalle": (
+                f"La demanda estimada está {abs(cambio):.0f}% por debajo del promedio histórico. "
+                f"Reduce tirajes y considera producción bajo demanda."
+            ),
+        })
+    elif cambio > 20:
+        recomendaciones.append({
+            "tipo": "oportunidad",
+            "prioridad": "alta",
+            "titulo": "Oportunidad de crecimiento",
+            "detalle": (
+                f"La demanda estimada supera el promedio histórico en {cambio:.0f}%. "
+                f"Asegura stock de insumos DTF (film, tinta, blanks)."
+            ),
         })
 
     return {
-        "fecha_generacion": datetime.now().isoformat(),
-        "horizonte": "Próximas 4 semanas",
-        "recomendaciones": recommendations,
-        "resumen": {
-            "categorias_alta_prioridad": sum(1 for r in recommendations if r["prioridad"] == "ALTA"),
-            "categorias_media_prioridad": sum(1 for r in recommendations if r["prioridad"] == "MEDIA"),
-            "unidades_totales_sugeridas": round(sum(r["demanda_predicha_unidades"] for r in recommendations), 1),
+        "modelo_usado": ganador,
+        "run_id": run_id,
+        "forecast_resumen": {
+            "total_unidades": round(total_pred, 1),
+            "rango": [round(pred["banda_inferior"].sum(), 1), round(pred["banda_superior"].sum(), 1)],
+            "cambio_vs_historico_pct": round(cambio, 1),
         },
+        "recomendaciones": recomendaciones,
+        "categorias": cat_analysis,
     }
 
 
-@app.get("/history/{categoria}", tags=["datos"])
-def get_history(
-    categoria: str,
-    semanas: int = Query(default=24, ge=1, le=52, description="Número de semanas de historial"),
-):
+# ─── SEASONALITY ─────────────────────────────────────────────────────────
+
+@app.get("/seasonality")
+def seasonality():
     """
-    Historial de ventas semanales de una categoría.
-    Útil para graficar tendencia histórica en el dashboard.
+    Retorna patrones de estacionalidad detectados:
+    semanal (por día) y mensual, tanto H&M como DTF.
     """
-    serie = load_csv("serie_semanal.csv")
-    if serie is None:
-        raise HTTPException(status_code=503, detail="Datos históricos no disponibles.")
+    serie = safe_read("SELECT * FROM serie_semanal ORDER BY fecha")
+    if serie.empty:
+        raise HTTPException(status_code=404, detail="No hay datos de serie temporal.")
 
-    cats = serie["categoria"].unique().tolist()
-    cat_match = None
-    for c in cats:
-        if c.lower() == categoria.lower():
-            cat_match = c
-            break
+    dias_nombre = {0: "Lunes", 1: "Martes", 2: "Miércoles", 3: "Jueves", 4: "Viernes", 5: "Sábado", 6: "Domingo"}
+    meses_nombre = {1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
+                    7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic"}
 
-    if cat_match is None:
-        raise HTTPException(status_code=404, detail=f"Categoría no encontrada. Disponibles: {cats}")
+    # Patrón semanal DTF
+    semanal_dtf = serie.groupby("dia_semana")["unidades"].mean()
+    semanal = []
+    from etl.etl_pipeline import HM_INDICE_SEMANAL
+    promedio_global = serie["unidades"].mean()
+    for dia in range(7):
+        dtf_val = semanal_dtf.get(dia, 0)
+        hm_val = HM_INDICE_SEMANAL.get(dia, 1.0) * promedio_global
+        semanal.append({
+            "dia": dia,
+            "nombre": dias_nombre[dia],
+            "dtf_promedio": round(dtf_val, 2),
+            "hm_escalado": round(hm_val, 2),
+        })
 
-    cat_data = (
-        serie[serie["categoria"] == cat_match]
-        .sort_values("semana_inicio")
-        .tail(semanas)
-    )
+    # Patrón mensual DTF
+    from etl.etl_pipeline import HM_INDICE_MENSUAL
+    mensual_dtf = serie.groupby("mes")["unidades"].mean()
+    mensual = []
+    for mes in range(1, 13):
+        dtf_val = mensual_dtf.get(mes, 0)
+        hm_val = HM_INDICE_MENSUAL.get(mes, 1.0) * promedio_global
+        mensual.append({
+            "mes": mes,
+            "nombre": meses_nombre[mes],
+            "dtf_promedio": round(dtf_val, 2),
+            "hm_escalado": round(hm_val, 2),
+        })
 
     return {
-        "categoria": cat_match,
-        "semanas_solicitadas": semanas,
-        "datos": [
-            {
-                "semana": str(row["semana_inicio"]),
-                "unidades": int(row["unidades"]),
-                "ingresos": round(float(row["ingresos_total"]), 2),
-            }
-            for _, row in cat_data.iterrows()
-        ],
-        "estadisticas": {
-            "total_unidades": int(cat_data["unidades"].sum()),
-            "promedio_semanal": round(float(cat_data["unidades"].mean()), 2),
-            "semana_pico": str(cat_data.loc[cat_data["unidades"].idxmax(), "semana_inicio"]),
-            "max_unidades_semana": int(cat_data["unidades"].max()),
-        },
+        "semanal": semanal,
+        "mensual": mensual,
+        "promedio_global_diario": round(promedio_global, 2),
     }
 
 
-@app.post("/train", response_model=TrainResponse, tags=["entrenamiento"])
-def retrain_models():
+# ─── HISTORY ─────────────────────────────────────────────────────────────
+
+@app.get("/history")
+def history(
+    limit: int = Query(500, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+):
+    """Retorna historial de ventas diarias."""
+    df = safe_read(f"""
+        SELECT fecha, unidades, ingreso_bruto, num_transacciones,
+               productos_unicos, dia_nombre, es_fin_semana
+        FROM serie_semanal
+        ORDER BY fecha DESC
+        LIMIT {limit} OFFSET {offset}
+    """)
+
+    total = safe_read("SELECT COUNT(*) as n FROM serie_semanal")
+    n_total = int(total.iloc[0]["n"]) if not total.empty else 0
+
+    return {
+        "total": n_total,
+        "limit": limit,
+        "offset": offset,
+        "data": df_to_records(df),
+    }
+
+
+# ─── UPLOAD ──────────────────────────────────────────────────────────────
+
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
     """
-    Re-entrena los modelos con los datos más recientes.
-    Ejecuta el pipeline ETL + entrenamiento de modelos.
+    Recibe un archivo Excel/CSV del usuario, ejecuta el pipeline ETL
+    y retorna resumen de los datos procesados.
+    """
+    # Validar extensión
+    ext = Path(file.filename).suffix.lower()
+    if ext not in (".xlsx", ".xls", ".csv"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Formato no soportado: {ext}. Usa .xlsx, .xls o .csv",
+        )
+
+    # Guardar temporalmente
+    tmp_dir = Path(tempfile.mkdtemp())
+    tmp_path = tmp_dir / file.filename
+    try:
+        with open(tmp_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+
+        log.info(f"Archivo recibido: {file.filename} ({len(content)} bytes)")
+
+        # Ejecutar ETL
+        from etl.etl_pipeline import ejecutar_pipeline
+        resultado = ejecutar_pipeline(str(tmp_path))
+
+        return resultado
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        log.error(f"Error en upload: {e}")
+        raise HTTPException(status_code=500, detail=f"Error procesando archivo: {str(e)}")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ─── TRAIN ───────────────────────────────────────────────────────────────
+
+@app.post("/train")
+def train():
+    """
+    Ejecuta el pipeline de entrenamiento:
+    SARIMA + Prophet + Random Forest + Transferencia H&M.
+    Compara, selecciona ganador, guarda todo a PostgreSQL.
     """
     try:
-        # Paso 1: ETL
-        etl_result = subprocess.run(
-            ["python3", str(ETL_SCRIPT)],
-            capture_output=True, text=True, timeout=120,
-        )
-        if etl_result.returncode != 0:
-            return TrainResponse(
-                status="error",
-                mensaje=f"Error en ETL: {etl_result.stderr[:500]}",
-                timestamp=datetime.now().isoformat(),
-            )
-
-        # Paso 2: Entrenamiento
-        train_result = subprocess.run(
-            ["python3", str(TRAIN_SCRIPT)],
-            capture_output=True, text=True, timeout=300,
-        )
-        if train_result.returncode != 0:
-            return TrainResponse(
-                status="error",
-                mensaje=f"Error en entrenamiento: {train_result.stderr[:500]}",
-                timestamp=datetime.now().isoformat(),
-            )
-
-        # Cargar métricas actualizadas
-        report = load_json("training_report.json")
-        metricas = report.get("modelos", {}) if report else None
-
-        return TrainResponse(
-            status="success",
-            mensaje="Modelos re-entrenados exitosamente.",
-            timestamp=datetime.now().isoformat(),
-            metricas=metricas,
-        )
-
-    except subprocess.TimeoutExpired:
-        return TrainResponse(
-            status="error",
-            mensaje="Timeout: el entrenamiento tardó más de 5 minutos.",
-            timestamp=datetime.now().isoformat(),
-        )
+        from models.train_models import ejecutar_entrenamiento
+        resultado = ejecutar_entrenamiento()
+        return resultado
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
+        log.error(f"Error en entrenamiento: {e}")
+        raise HTTPException(status_code=500, detail=f"Error durante entrenamiento: {str(e)}")
 
 
-# ============================================================================
-# MANEJO DE ERRORES
-# ============================================================================
-@app.exception_handler(404)
-async def not_found_handler(request, exc):
-    return JSONResponse(
-        status_code=404,
-        content={"detail": str(exc.detail), "endpoints_disponibles": "/docs"},
-    )
+# ─── TRAINING RUNS HISTORY ──────────────────────────────────────────────
+
+@app.get("/runs")
+def training_runs(limit: int = Query(10, ge=1, le=100)):
+    """Retorna historial de training runs."""
+    df = safe_read(f"""
+        SELECT * FROM training_runs
+        ORDER BY fecha_ejecucion DESC
+        LIMIT {limit}
+    """)
+    return {"runs": df_to_records(df)}
 
 
-@app.exception_handler(500)
-async def server_error_handler(request, exc):
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Error interno del servidor", "contacto": "Revisar logs"},
-    )
-
-
-# ============================================================================
+# ═══════════════════════════════════════════════════════════════════════════
 # MAIN
-# ============================================================================
+# ═══════════════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.getenv("API_PORT", 8000))
+    uvicorn.run(
+        "api.main:app",
+        host="0.0.0.0",
+        port=port,
+        reload=True,
+        log_level="info",
+    )

@@ -1,0 +1,84 @@
+# ============================================================================
+# DTF Predictive Platform — Docker Compose
+# ============================================================================
+# Levanta 3 servicios: PostgreSQL, FastAPI (API), Streamlit (Dashboard)
+#
+# Uso:
+#   docker-compose up -d          # Levantar todo
+#   docker-compose up -d --build  # Rebuild después de cambios en código
+#   docker-compose logs -f api    # Ver logs de la API
+#   docker-compose down           # Detener todo
+#   docker-compose down -v        # Detener + borrar volúmenes (reset DB)
+# ============================================================================
+
+version: "3.9"
+
+services:
+  # ── PostgreSQL ──
+  db:
+    image: postgres:16-alpine
+    container_name: dtf-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-dtf_platform}
+      POSTGRES_USER: ${POSTGRES_USER:-dtf_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dtf_secret_2026}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dtf_user} -d ${POSTGRES_DB:-dtf_platform}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── FastAPI Backend ──
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dtf-api
+    restart: unless-stopped
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-dtf_user}:${POSTGRES_PASSWORD:-dtf_secret_2026}@db:5432/${POSTGRES_DB:-dtf_platform}
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - .:/app
+      - uploads:/app/data/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ── Streamlit Dashboard ──
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dtf-dashboard
+    restart: unless-stopped
+    command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
+    ports:
+      - "${DASHBOARD_PORT:-8501}:8501"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-dtf_user}:${POSTGRES_PASSWORD:-dtf_secret_2026}@db:5432/${POSTGRES_DB:-dtf_platform}
+      API_URL: http://api:8000
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - .:/app
+      - uploads:/app/data/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+
+volumes:
+  pgdata:
+    driver: local
+  uploads:
+    driver: local

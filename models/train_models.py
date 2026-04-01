@@ -1,13 +1,19 @@
 """
-ETL Pipeline v4.0 — DTF Fashion Predictive Analytics Platform
-Acepta Excel/CSV del usuario, limpia, genera features, escribe a PostgreSQL.
+Train Models v4.1 — DTF Fashion Predictive Analytics Platform
+Entrena SARIMA, Prophet, Random Forest.
+Compara automáticamente, selecciona ganador, guarda a PostgreSQL.
+
+Los índices estacionales de retail (derivados de H&M) se inyectan como
+features del Random Forest vía la tabla 'features' del ETL. No se exponen
+al usuario como modelo independiente.
 """
 
 import os
 import sys
 import logging
-import hashlib
-from datetime import datetime, timedelta
+import warnings
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -15,7 +21,8 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
-# ── Agregar raíz del proyecto al path ──────────────────────────────────────
+warnings.filterwarnings("ignore")
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from database.connection import engine, read_sql, write_dataframe
 
@@ -23,501 +30,720 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("etl_pipeline")
+log = logging.getLogger("train_models")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ÍNDICES ESTACIONALES H&M HARDCODEADOS
-# Extraídos de 31.7M transacciones — SARIMA(1,1,1)(1,1,1)[7], MAPE 15.48%
+# CONSTANTES
 # ═══════════════════════════════════════════════════════════════════════════
+
+HORIZONTE_DIAS = 30
+BANDA_INCERTIDUMBRE = 0.30  # ±30%
+MIN_DATOS_SARIMA = 14       # mínimo para SARIMA
+MIN_DATOS_RF = 30           # mínimo para Random Forest (necesita lags)
+
+# Índices H&M hardcodeados (replicados del ETL para independencia)
 HM_INDICE_SEMANAL = {
-    0: 0.94,   # Lunes
-    1: 0.89,   # Martes
-    2: 0.91,   # Miércoles
-    3: 0.95,   # Jueves
-    4: 1.05,   # Viernes
-    5: 1.16,   # Sábado  (pico H&M: 48,383 uds promedio)
-    6: 1.10,   # Domingo
+    0: 0.94, 1: 0.89, 2: 0.91, 3: 0.95,
+    4: 1.05, 5: 1.16, 6: 1.10,
 }
-
 HM_INDICE_MENSUAL = {
-    1:  0.92,   # Enero
-    2:  0.90,   # Febrero
-    3:  0.86,   # Marzo
-    4:  0.95,   # Abril
-    5:  1.14,   # Mayo
-    6:  1.41,   # Junio   (pico H&M: 61,000 uds)
-    7:  1.16,   # Julio
-    8:  0.95,   # Agosto
-    9:  1.03,   # Septiembre
-    10: 0.93,   # Octubre
-    11: 0.93,   # Noviembre
-    12: 0.84,   # Diciembre (mínimo H&M: 36,500 uds)
+    1: 0.92, 2: 0.90, 3: 0.86, 4: 0.95, 5: 1.14, 6: 1.41,
+    7: 1.16, 8: 0.95, 9: 1.03, 10: 0.93, 11: 0.93, 12: 0.84,
 }
-
-# Factores de corrección DTF México vs H&M Europa
-# Calculados en research/dtf_finetuning.py
 DTF_CORRECCION_MENSUAL = {
-    1:  1.100,  # Enero   — ajuste moderado
-    2:  1.529,  # Febrero — 53% más que patrón H&M
-    3:  1.754,  # Marzo   — 75% más (temporada fuerte México)
-    4:  1.200,  # Abril   — estimado (sin datos suficientes)
-    5:  1.000,  # Mayo    — sin corrección (sin datos)
-    6:  1.000,  # Junio
-    7:  1.000,  # Julio
-    8:  1.000,  # Agosto
-    9:  1.000,  # Septiembre
-    10: 0.704,  # Octubre  — arranque negocio, bajo vs H&M
-    11: 0.702,  # Noviembre
-    12: 0.900,  # Diciembre — estimado
+    1: 1.100, 2: 1.529, 3: 1.754, 4: 1.200, 5: 1.000, 6: 1.000,
+    7: 1.000, 8: 1.000, 9: 1.000, 10: 0.704, 11: 0.702, 12: 0.900,
 }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 1. CARGA DE DATOS
+# MÉTRICAS DE EVALUACIÓN
 # ═══════════════════════════════════════════════════════════════════════════
 
-def cargar_archivo(ruta: str) -> pd.DataFrame:
-    """Carga Excel (.xlsx/.xls) o CSV y normaliza columnas."""
-    ruta = Path(ruta)
-    log.info(f"Cargando archivo: {ruta.name}")
+def calcular_metricas(y_real: np.ndarray, y_pred: np.ndarray) -> dict:
+    """Calcula MAE, MAPE y R² entre valores reales y predichos."""
+    y_real = np.array(y_real, dtype=float)
+    y_pred = np.array(y_pred, dtype=float)
 
-    if not ruta.exists():
-        raise FileNotFoundError(f"No se encontró: {ruta}")
+    mae = np.mean(np.abs(y_real - y_pred))
 
-    ext = ruta.suffix.lower()
-    if ext in (".xlsx", ".xls"):
-        df = pd.read_excel(ruta)
-    elif ext == ".csv":
-        # Intentar detectar separador
-        for sep in [",", ";", "\t", "|"]:
-            try:
-                df = pd.read_csv(ruta, sep=sep, encoding="utf-8")
-                if len(df.columns) > 1:
-                    break
-            except Exception:
-                continue
-        else:
-            df = pd.read_csv(ruta)
+    # MAPE: evitar división por cero
+    mask = y_real != 0
+    if mask.sum() > 0:
+        mape = np.mean(np.abs((y_real[mask] - y_pred[mask]) / y_real[mask])) * 100
     else:
-        raise ValueError(f"Formato no soportado: {ext}. Usa .xlsx, .xls o .csv")
+        mape = 100.0
 
-    # Normalizar nombres de columnas
-    df.columns = (
-        df.columns
-        .str.strip()
-        .str.lower()
-        .str.replace(r"[áà]", "a", regex=True)
-        .str.replace(r"[éè]", "e", regex=True)
-        .str.replace(r"[íì]", "i", regex=True)
-        .str.replace(r"[óò]", "o", regex=True)
-        .str.replace(r"[úù]", "u", regex=True)
-        .str.replace(r"[ñ]", "n", regex=True)
-        .str.replace(r"\s+", "_", regex=True)
-        .str.replace(r"[^\w]", "", regex=True)
-    )
+    # R²
+    ss_res = np.sum((y_real - y_pred) ** 2)
+    ss_tot = np.sum((y_real - np.mean(y_real)) ** 2)
+    r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
 
-    log.info(f"  → {len(df)} filas, {len(df.columns)} columnas: {list(df.columns)}")
-    return df
+    return {
+        "mae": round(mae, 4),
+        "mape": round(mape, 2),
+        "r2": round(r2, 4),
+    }
 
 
-def detectar_columnas(df: pd.DataFrame) -> dict:
-    """Detecta automáticamente qué columnas corresponden a fecha, cantidad, precio, etc."""
-    mapeo = {}
-
-    # Fecha
-    for col in df.columns:
-        if any(k in col for k in ["fecha", "date", "dia", "t_dat"]):
-            mapeo["fecha"] = col
-            break
-    if "fecha" not in mapeo:
-        # Buscar columna con datos tipo datetime
-        for col in df.columns:
-            try:
-                parsed = pd.to_datetime(df[col], errors="coerce")
-                if parsed.notna().sum() > len(df) * 0.5:
-                    mapeo["fecha"] = col
-                    break
-            except Exception:
-                continue
-
-    # Cantidad / unidades
-    for col in df.columns:
-        if any(k in col for k in ["cantidad", "unidades", "qty", "quantity", "units"]):
-            mapeo["cantidad"] = col
-            break
-
-    # Precio
-    for col in df.columns:
-        if any(k in col for k in ["precio", "price", "monto", "total", "ingreso", "revenue"]):
-            mapeo["precio"] = col
-            break
-
-    # Producto / diseño
-    for col in df.columns:
-        if any(k in col for k in ["producto", "diseno", "design", "sku", "article", "nombre"]):
-            mapeo["producto"] = col
-            break
-
-    # Categoría
-    for col in df.columns:
-        if any(k in col for k in ["categoria", "category", "tipo", "type", "linea"]):
-            mapeo["categoria"] = col
-            break
-
-    log.info(f"  → Mapeo detectado: {mapeo}")
-    return mapeo
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 2. LIMPIEZA
-# ═══════════════════════════════════════════════════════════════════════════
-
-def limpiar_datos(df: pd.DataFrame, mapeo: dict) -> pd.DataFrame:
-    """Limpia y valida los datos crudos."""
-    log.info("Limpiando datos...")
-    n_original = len(df)
-
-    # Parsear fecha
-    col_fecha = mapeo.get("fecha")
-    if col_fecha is None:
-        raise ValueError("No se detectó columna de fecha. Asegúrate de tener una columna 'fecha' o 'date'.")
-    df["fecha"] = pd.to_datetime(df[col_fecha], errors="coerce", dayfirst=True)
-    nulos_fecha = df["fecha"].isna().sum()
-    if nulos_fecha > 0:
-        log.warning(f"  → {nulos_fecha} filas con fecha inválida eliminadas")
-        df = df.dropna(subset=["fecha"])
-
-    # Cantidad
-    col_cant = mapeo.get("cantidad")
-    if col_cant:
-        df["cantidad"] = pd.to_numeric(df[col_cant], errors="coerce").fillna(1).astype(int)
-        df = df[df["cantidad"] > 0]
-    else:
-        df["cantidad"] = 1
-        log.warning("  → No se detectó columna de cantidad; asumiendo 1 unidad por fila")
-
-    # Precio
-    col_precio = mapeo.get("precio")
-    if col_precio:
-        df["precio_unitario"] = pd.to_numeric(df[col_precio], errors="coerce").fillna(0)
-    else:
-        df["precio_unitario"] = 0.0
-        log.warning("  → No se detectó columna de precio")
-
-    # Producto
-    col_prod = mapeo.get("producto")
-    if col_prod:
-        df["producto"] = df[col_prod].astype(str).str.strip()
-    else:
-        df["producto"] = "general"
-
-    # Categoría
-    col_cat = mapeo.get("categoria")
-    if col_cat:
-        df["categoria"] = df[col_cat].astype(str).str.strip().str.title()
-    else:
-        df["categoria"] = "General"
-
-    # Eliminar duplicados exactos
-    n_antes = len(df)
-    df = df.drop_duplicates()
-    if len(df) < n_antes:
-        log.info(f"  → {n_antes - len(df)} duplicados eliminados")
-
-    # Calcular ingreso
-    df["ingreso_bruto"] = df["cantidad"] * df["precio_unitario"]
-
-    # Generar ID de venta único
-    df["venta_id"] = df.apply(
-        lambda r: hashlib.md5(
-            f"{r['fecha']}_{r['producto']}_{r['cantidad']}_{r.name}".encode()
-        ).hexdigest()[:12],
-        axis=1,
-    )
-
-    # Ordenar por fecha
-    df = df.sort_values("fecha").reset_index(drop=True)
-
-    log.info(f"  → Limpieza completa: {n_original} → {len(df)} filas")
-    log.info(f"  → Período: {df['fecha'].min().date()} a {df['fecha'].max().date()}")
-    return df
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 3. AGREGACIÓN A SERIE TEMPORAL
-# ═══════════════════════════════════════════════════════════════════════════
-
-def agregar_serie_semanal(df: pd.DataFrame) -> pd.DataFrame:
-    """Agrega ventas diarias y rellena días sin actividad."""
-    log.info("Generando serie temporal diaria...")
-
-    fecha_min = df["fecha"].min().normalize()
-    fecha_max = df["fecha"].max().normalize()
-
-    # Crear rango completo de fechas
-    rango = pd.date_range(start=fecha_min, end=fecha_max, freq="D")
-    serie = pd.DataFrame({"fecha": rango})
-
-    # Agregar por día
-    diario = (
-        df.groupby(df["fecha"].dt.normalize())
-        .agg(
-            unidades=("cantidad", "sum"),
-            ingreso_bruto=("ingreso_bruto", "sum"),
-            num_transacciones=("venta_id", "nunique"),
-            productos_unicos=("producto", "nunique"),
-        )
-        .reset_index()
-        .rename(columns={"fecha": "fecha"})
-    )
-
-    serie = serie.merge(diario, on="fecha", how="left")
-    serie["unidades"] = serie["unidades"].fillna(0).astype(int)
-    serie["ingreso_bruto"] = serie["ingreso_bruto"].fillna(0.0)
-    serie["num_transacciones"] = serie["num_transacciones"].fillna(0).astype(int)
-    serie["productos_unicos"] = serie["productos_unicos"].fillna(0).astype(int)
-
-    # Campos temporales
-    serie["dia_semana"] = serie["fecha"].dt.dayofweek
-    serie["dia_nombre"] = serie["fecha"].dt.day_name()
-    serie["semana_iso"] = serie["fecha"].dt.isocalendar().week.astype(int)
-    serie["mes"] = serie["fecha"].dt.month
-    serie["anio"] = serie["fecha"].dt.year
-    serie["es_fin_semana"] = serie["dia_semana"].isin([5, 6]).astype(int)
-
-    # Ingreso acumulado
-    serie["ingreso_acumulado"] = serie["ingreso_bruto"].cumsum()
-
-    log.info(f"  → Serie de {len(serie)} días ({serie['unidades'].sum()} unidades totales)")
-    log.info(f"  → Días con actividad: {(serie['unidades'] > 0).sum()} de {len(serie)}")
-    return serie
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 4. FEATURE ENGINEERING
-# ═══════════════════════════════════════════════════════════════════════════
-
-def generar_features(serie: pd.DataFrame) -> pd.DataFrame:
-    """Genera features para los modelos ML incluyendo índices H&M."""
-    log.info("Generando features...")
-    f = serie[["fecha", "unidades", "dia_semana", "mes", "es_fin_semana"]].copy()
-
-    # ── Lags ──
-    for lag in [1, 7, 14, 21, 28]:
-        f[f"lag_{lag}"] = f["unidades"].shift(lag)
-
-    # ── Rolling stats ──
-    for ventana in [7, 14, 30]:
-        f[f"rolling_mean_{ventana}"] = (
-            f["unidades"].rolling(window=ventana, min_periods=1).mean()
-        )
-        f[f"rolling_std_{ventana}"] = (
-            f["unidades"].rolling(window=ventana, min_periods=1).std().fillna(0)
-        )
-
-    # ── Rolling max y min (ventana 7) ──
-    f["rolling_max_7"] = f["unidades"].rolling(window=7, min_periods=1).max()
-    f["rolling_min_7"] = f["unidades"].rolling(window=7, min_periods=1).min()
-
-    # ── Cambio semanal (%) ──
-    media_actual = f["unidades"].rolling(window=7, min_periods=1).mean()
-    media_anterior = f["unidades"].shift(7).rolling(window=7, min_periods=1).mean()
-    f["cambio_semanal_pct"] = ((media_actual - media_anterior) / media_anterior.replace(0, np.nan) * 100).fillna(0)
-
-    # ── Momentum (diferencia absoluta vs semana pasada) ──
-    f["momentum_7d"] = f["unidades"] - f["unidades"].shift(7)
-    f["momentum_7d"] = f["momentum_7d"].fillna(0)
-
-    # ── Índices estacionales H&M ──
-    f["hm_indice_semanal"] = f["dia_semana"].map(HM_INDICE_SEMANAL)
-    f["hm_indice_mensual"] = f["mes"].map(HM_INDICE_MENSUAL)
-    f["hm_correccion_dtf"] = f["mes"].map(DTF_CORRECCION_MENSUAL)
-
-    # Índice combinado H&M calibrado
-    f["hm_indice_combinado"] = (
-        f["hm_indice_semanal"] * f["hm_indice_mensual"] * f["hm_correccion_dtf"]
-    )
-
-    # ── Encoding cíclico para día y mes ──
-    f["dia_sin"] = np.sin(2 * np.pi * f["dia_semana"] / 7)
-    f["dia_cos"] = np.cos(2 * np.pi * f["dia_semana"] / 7)
-    f["mes_sin"] = np.sin(2 * np.pi * f["mes"] / 12)
-    f["mes_cos"] = np.cos(2 * np.pi * f["mes"] / 12)
-
-    # ── Días desde inicio ──
-    f["dias_desde_inicio"] = (f["fecha"] - f["fecha"].min()).dt.days
-
-    # ── Tendencia lineal normalizada [0,1] ──
-    max_dias = f["dias_desde_inicio"].max()
-    f["tendencia_norm"] = f["dias_desde_inicio"] / max_dias if max_dias > 0 else 0
-
-    # ── Rellenar NaN restantes ──
-    f = f.fillna(0)
-
-    n_features = len([c for c in f.columns if c not in ("fecha", "unidades")])
-    log.info(f"  → {n_features} features generados")
-    return f
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 5. ESCRITURA A POSTGRESQL
-# ═══════════════════════════════════════════════════════════════════════════
-
-def escribir_a_db(
-    df_ventas: pd.DataFrame,
-    df_serie: pd.DataFrame,
-    df_features: pd.DataFrame,
-) -> dict:
-    """Escribe los DataFrames procesados a PostgreSQL."""
-    log.info("Escribiendo a base de datos...")
-    db = engine()
-    resumen = {}
-
-    # ── Tabla: ventas ──
-    cols_ventas = [
-        "venta_id", "fecha", "producto", "categoria",
-        "cantidad", "precio_unitario", "ingreso_bruto",
-    ]
-    df_v = df_ventas[[c for c in cols_ventas if c in df_ventas.columns]].copy()
-    df_v["created_at"] = datetime.now()
-
-    # Limpiar tabla existente e insertar
-    with db.begin() as conn:
-        conn.execute(text("DELETE FROM ventas"))
-    write_dataframe(df_v, "ventas", if_exists="append")
-    resumen["ventas"] = len(df_v)
-    log.info(f"  → ventas: {len(df_v)} registros")
-
-    # ── Tabla: serie_semanal ──
-    cols_serie = [
-        "fecha", "unidades", "ingreso_bruto", "num_transacciones",
-        "productos_unicos", "dia_semana", "dia_nombre", "semana_iso",
-        "mes", "anio", "es_fin_semana", "ingreso_acumulado",
-    ]
-    df_s = df_serie[[c for c in cols_serie if c in df_serie.columns]].copy()
-    df_s["created_at"] = datetime.now()
-
-    with db.begin() as conn:
-        conn.execute(text("DELETE FROM serie_semanal"))
-    write_dataframe(df_s, "serie_semanal", if_exists="append")
-    resumen["serie_semanal"] = len(df_s)
-    log.info(f"  → serie_semanal: {len(df_s)} registros")
-
-    # ── Tabla: features ──
-    df_f = df_features.copy()
-    df_f["created_at"] = datetime.now()
-
-    with db.begin() as conn:
-        conn.execute(text("DELETE FROM features"))
-    write_dataframe(df_f, "features", if_exists="append")
-    resumen["features"] = len(df_f)
-    log.info(f"  → features: {len(df_f)} registros")
-
-    # ── Tabla: factores_hm ──
-    factores = []
-    for dia, idx in HM_INDICE_SEMANAL.items():
-        factores.append({
-            "tipo": "semanal",
-            "clave": str(dia),
-            "valor": idx,
-            "descripcion": f"Índice día {dia} (0=Lun, 6=Dom)",
-        })
-    for mes, idx in HM_INDICE_MENSUAL.items():
-        factores.append({
-            "tipo": "mensual",
-            "clave": str(mes),
-            "valor": idx,
-            "descripcion": f"Índice mes {mes}",
-        })
-    for mes, corr in DTF_CORRECCION_MENSUAL.items():
-        factores.append({
-            "tipo": "correccion_dtf",
-            "clave": str(mes),
-            "valor": corr,
-            "descripcion": f"Corrección DTF mes {mes}",
-        })
-
-    df_hm = pd.DataFrame(factores)
-    df_hm["created_at"] = datetime.now()
-
-    with db.begin() as conn:
-        conn.execute(text("DELETE FROM factores_hm"))
-    write_dataframe(df_hm, "factores_hm", if_exists="append")
-    resumen["factores_hm"] = len(df_hm)
-    log.info(f"  → factores_hm: {len(df_hm)} registros")
-
-    return resumen
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 6. PIPELINE PRINCIPAL
-# ═══════════════════════════════════════════════════════════════════════════
-
-def ejecutar_pipeline(ruta_archivo: str) -> dict:
+def calcular_baseline_naive(serie: pd.Series, horizonte: int) -> dict:
     """
-    Pipeline ETL completo:
-      1. Carga archivo Excel/CSV
-      2. Detecta columnas automáticamente
-      3. Limpia y valida
-      4. Agrega serie temporal diaria
-      5. Genera features (lags, rolling, H&M)
-      6. Escribe todo a PostgreSQL
+    Baseline naive: repetir los últimos `horizonte` días como pronóstico.
+    Sirve como referencia para medir mejora ≥20-25%.
+    """
+    if len(serie) < horizonte * 2:
+        # Si no hay suficientes datos, usar la media
+        pred = np.full(horizonte, serie.mean())
+        real = serie.values[-horizonte:]
+        if len(real) < horizonte:
+            real = np.pad(real, (0, horizonte - len(real)), constant_values=serie.mean())
+    else:
+        real = serie.values[-horizonte:]
+        pred = serie.values[-2 * horizonte : -horizonte]
+
+    return calcular_metricas(real, pred)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MODELO 1: SARIMA
+# ═══════════════════════════════════════════════════════════════════════════
+
+def entrenar_sarima(serie: pd.Series, horizonte: int = HORIZONTE_DIAS) -> dict:
+    """
+    Entrena SARIMA(1,1,1)(1,1,1)[7] sobre la serie de unidades diarias.
+    """
+    log.info("─── Entrenando SARIMA(1,1,1)(1,1,1)[7] ───")
+    from statsmodels.tsa.statespace.sarimax import SARIMAX
+
+    n = len(serie)
+    if n < MIN_DATOS_SARIMA:
+        log.warning(f"  → Solo {n} datos. SARIMA necesita al menos {MIN_DATOS_SARIMA}.")
+        return {"status": "skip", "razon": "datos insuficientes"}
+
+    # Split train/test
+    test_size = min(horizonte, max(7, n // 5))
+    train = serie.iloc[:-test_size]
+    test = serie.iloc[-test_size:]
+
+    try:
+        modelo = SARIMAX(
+            train,
+            order=(1, 1, 1),
+            seasonal_order=(1, 1, 1, 7),
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        )
+        resultado = modelo.fit(disp=False, maxiter=200)
+
+        # Predicción sobre test
+        pred_test = resultado.forecast(steps=test_size)
+        pred_test = np.maximum(pred_test, 0)  # No permitir negativos
+
+        metricas = calcular_metricas(test.values, pred_test.values)
+
+        # Reentrenar con toda la serie para forecast futuro
+        modelo_full = SARIMAX(
+            serie,
+            order=(1, 1, 1),
+            seasonal_order=(1, 1, 1, 7),
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        )
+        resultado_full = modelo_full.fit(disp=False, maxiter=200)
+
+        forecast = resultado_full.forecast(steps=horizonte)
+        forecast = np.maximum(forecast, 0)
+
+        log.info(f"  → MAE: {metricas['mae']:.2f} | MAPE: {metricas['mape']:.1f}% | R²: {metricas['r2']:.3f}")
+
+        return {
+            "status": "ok",
+            "nombre": "SARIMA",
+            "metricas": metricas,
+            "forecast": forecast.values,
+            "pred_test": pred_test.values,
+            "test_real": test.values,
+            "parametros": "SARIMA(1,1,1)(1,1,1)[7]",
+            "aic": round(resultado.aic, 2),
+        }
+
+    except Exception as e:
+        log.error(f"  → Error SARIMA: {e}")
+        return {"status": "error", "razon": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MODELO 2: PROPHET
+# ═══════════════════════════════════════════════════════════════════════════
+
+def entrenar_prophet(df_serie: pd.DataFrame, horizonte: int = HORIZONTE_DIAS) -> dict:
+    """
+    Entrena Prophet (Facebook) sobre la serie temporal.
+    Requiere columnas 'fecha' y 'unidades'.
+    """
+    log.info("─── Entrenando Prophet ───")
+    try:
+        from prophet import Prophet
+    except ImportError:
+        log.warning("  → Prophet no instalado. Intentando con fbprophet...")
+        try:
+            from fbprophet import Prophet
+        except ImportError:
+            return {"status": "skip", "razon": "Prophet no disponible"}
+
+    n = len(df_serie)
+    if n < MIN_DATOS_SARIMA:
+        return {"status": "skip", "razon": "datos insuficientes"}
+
+    # Preparar formato Prophet
+    df_p = df_serie[["fecha", "unidades"]].rename(
+        columns={"fecha": "ds", "unidades": "y"}
+    ).copy()
+    df_p["ds"] = pd.to_datetime(df_p["ds"])
+
+    test_size = min(horizonte, max(7, n // 5))
+    train_p = df_p.iloc[:-test_size]
+    test_p = df_p.iloc[-test_size:]
+
+    try:
+        modelo = Prophet(
+            yearly_seasonality=False,
+            weekly_seasonality=True,
+            daily_seasonality=False,
+            seasonality_mode="multiplicative",
+            changepoint_prior_scale=0.05,
+            interval_width=0.60,
+        )
+        # Suprimir logs de Prophet
+        modelo.fit(train_p)
+
+        # Predicción sobre test
+        future_test = modelo.make_future_dataframe(periods=test_size, freq="D")
+        pred_full = modelo.predict(future_test)
+        pred_test = pred_full.tail(test_size)["yhat"].values
+        pred_test = np.maximum(pred_test, 0)
+
+        metricas = calcular_metricas(test_p["y"].values, pred_test)
+
+        # Reentrenar con todo para forecast
+        modelo_full = Prophet(
+            yearly_seasonality=False,
+            weekly_seasonality=True,
+            daily_seasonality=False,
+            seasonality_mode="multiplicative",
+            changepoint_prior_scale=0.05,
+            interval_width=0.60,
+        )
+        modelo_full.fit(df_p)
+
+        future = modelo_full.make_future_dataframe(periods=horizonte, freq="D")
+        forecast_df = modelo_full.predict(future)
+        forecast = forecast_df.tail(horizonte)["yhat"].values
+        forecast = np.maximum(forecast, 0)
+
+        log.info(f"  → MAE: {metricas['mae']:.2f} | MAPE: {metricas['mape']:.1f}% | R²: {metricas['r2']:.3f}")
+
+        return {
+            "status": "ok",
+            "nombre": "Prophet",
+            "metricas": metricas,
+            "forecast": forecast,
+            "pred_test": pred_test,
+            "test_real": test_p["y"].values,
+            "parametros": "weekly_seas=mult, cp_prior=0.05",
+        }
+
+    except Exception as e:
+        log.error(f"  → Error Prophet: {e}")
+        return {"status": "error", "razon": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MODELO 3: RANDOM FOREST
+# ═══════════════════════════════════════════════════════════════════════════
+
+def entrenar_random_forest(df_features: pd.DataFrame, horizonte: int = HORIZONTE_DIAS) -> dict:
+    """
+    Entrena Random Forest con los features del ETL.
+    """
+    log.info("─── Entrenando Random Forest ───")
+    from sklearn.ensemble import RandomForestRegressor
+
+    n = len(df_features)
+    if n < MIN_DATOS_RF:
+        return {"status": "skip", "razon": f"necesita al menos {MIN_DATOS_RF} días"}
+
+    # Seleccionar features
+    feature_cols = [
+        "dia_semana", "es_fin_semana", "mes",
+        "lag_1", "lag_7", "lag_14", "lag_21", "lag_28",
+        "rolling_mean_7", "rolling_mean_14", "rolling_mean_30",
+        "rolling_std_7", "rolling_std_14",
+        "rolling_max_7", "rolling_min_7",
+        "cambio_semanal_pct", "momentum_7d",
+        "hm_indice_semanal", "hm_indice_mensual", "hm_indice_combinado",
+        "dia_sin", "dia_cos", "mes_sin", "mes_cos",
+        "dias_desde_inicio", "tendencia_norm",
+    ]
+    # Usar solo las que existen
+    feature_cols = [c for c in feature_cols if c in df_features.columns]
+    target = "unidades"
+
+    df_ml = df_features[feature_cols + [target, "fecha"]].dropna().copy()
+    if len(df_ml) < MIN_DATOS_RF:
+        return {"status": "skip", "razon": "datos insuficientes tras dropna"}
+
+    test_size = min(horizonte, max(7, len(df_ml) // 5))
+    train_df = df_ml.iloc[:-test_size]
+    test_df = df_ml.iloc[-test_size:]
+
+    X_train = train_df[feature_cols].values
+    y_train = train_df[target].values
+    X_test = test_df[feature_cols].values
+    y_test = test_df[target].values
+
+    try:
+        modelo = RandomForestRegressor(
+            n_estimators=200,
+            max_depth=6,
+            min_samples_split=5,
+            min_samples_leaf=3,
+            random_state=42,
+            n_jobs=-1,
+        )
+        modelo.fit(X_train, y_train)
+
+        pred_test = modelo.predict(X_test)
+        pred_test = np.maximum(pred_test, 0)
+
+        metricas = calcular_metricas(y_test, pred_test)
+
+        # Feature importance
+        importancias = dict(zip(feature_cols, modelo.feature_importances_))
+        top_features = sorted(importancias.items(), key=lambda x: x[1], reverse=True)[:5]
+
+        # Forecast futuro: generar features sintéticos
+        forecast = _generar_forecast_rf(modelo, df_ml, feature_cols, horizonte)
+
+        log.info(f"  → MAE: {metricas['mae']:.2f} | MAPE: {metricas['mape']:.1f}% | R²: {metricas['r2']:.3f}")
+        log.info(f"  → Top features: {[f'{k}: {v:.3f}' for k, v in top_features]}")
+
+        return {
+            "status": "ok",
+            "nombre": "Random Forest",
+            "metricas": metricas,
+            "forecast": forecast,
+            "pred_test": pred_test,
+            "test_real": y_test,
+            "parametros": "n_est=200, max_d=6, min_split=5",
+            "importancia_features": importancias,
+        }
+
+    except Exception as e:
+        log.error(f"  → Error Random Forest: {e}")
+        return {"status": "error", "razon": str(e)}
+
+
+def _generar_forecast_rf(
+    modelo, df_hist: pd.DataFrame, feature_cols: list, horizonte: int
+) -> np.ndarray:
+    """Genera forecast iterativo con Random Forest (autoregresivo)."""
+    ultimo_dia = pd.to_datetime(df_hist["fecha"].max())
+    serie_extendida = df_hist[["fecha", "unidades"]].copy()
+    predicciones = []
+
+    for i in range(horizonte):
+        nueva_fecha = ultimo_dia + pd.Timedelta(days=i + 1)
+        dia_semana = nueva_fecha.dayofweek
+        mes = nueva_fecha.month
+
+        # Construir fila de features
+        unidades_hist = serie_extendida["unidades"].values
+        fila = {}
+
+        fila["dia_semana"] = dia_semana
+        fila["es_fin_semana"] = 1 if dia_semana in [5, 6] else 0
+        fila["mes"] = mes
+
+        # Lags (usando serie extendida con predicciones previas)
+        for lag in [1, 7, 14, 21, 28]:
+            idx = len(unidades_hist) - lag
+            fila[f"lag_{lag}"] = unidades_hist[idx] if idx >= 0 else 0
+
+        # Rolling stats
+        for v in [7, 14, 30]:
+            ventana = unidades_hist[-v:] if len(unidades_hist) >= v else unidades_hist
+            fila[f"rolling_mean_{v}"] = np.mean(ventana)
+            fila[f"rolling_std_{v}"] = np.std(ventana) if len(ventana) > 1 else 0
+
+        fila["rolling_max_7"] = np.max(unidades_hist[-7:]) if len(unidades_hist) >= 7 else np.max(unidades_hist)
+        fila["rolling_min_7"] = np.min(unidades_hist[-7:]) if len(unidades_hist) >= 7 else np.min(unidades_hist)
+
+        # Cambio semanal
+        if len(unidades_hist) >= 14:
+            m1 = np.mean(unidades_hist[-7:])
+            m2 = np.mean(unidades_hist[-14:-7])
+            fila["cambio_semanal_pct"] = ((m1 - m2) / m2 * 100) if m2 != 0 else 0
+        else:
+            fila["cambio_semanal_pct"] = 0
+
+        fila["momentum_7d"] = (unidades_hist[-1] - unidades_hist[-7]) if len(unidades_hist) >= 7 else 0
+
+        # H&M
+        fila["hm_indice_semanal"] = HM_INDICE_SEMANAL.get(dia_semana, 1.0)
+        fila["hm_indice_mensual"] = HM_INDICE_MENSUAL.get(mes, 1.0)
+        fila["hm_indice_combinado"] = (
+            fila["hm_indice_semanal"]
+            * fila["hm_indice_mensual"]
+            * DTF_CORRECCION_MENSUAL.get(mes, 1.0)
+        )
+
+        # Cíclicos
+        fila["dia_sin"] = np.sin(2 * np.pi * dia_semana / 7)
+        fila["dia_cos"] = np.cos(2 * np.pi * dia_semana / 7)
+        fila["mes_sin"] = np.sin(2 * np.pi * mes / 12)
+        fila["mes_cos"] = np.cos(2 * np.pi * mes / 12)
+
+        dias_total = (nueva_fecha - pd.to_datetime(df_hist["fecha"].min())).days
+        fila["dias_desde_inicio"] = dias_total
+        max_d = df_hist["dias_desde_inicio"].max() if "dias_desde_inicio" in df_hist.columns else dias_total
+        fila["tendencia_norm"] = dias_total / max_d if max_d > 0 else 0
+
+        # Predecir
+        X_new = np.array([[fila.get(c, 0) for c in feature_cols]])
+        pred = max(0, modelo.predict(X_new)[0])
+        predicciones.append(pred)
+
+        # Agregar a serie extendida
+        nueva_fila = pd.DataFrame({"fecha": [nueva_fecha], "unidades": [pred]})
+        serie_extendida = pd.concat([serie_extendida, nueva_fila], ignore_index=True)
+
+    return np.array(predicciones)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MODELO 4: TRANSFERENCIA H&M
+# ═══════════════════════════════════════════════════════════════════════════
+
+def generar_forecast_hm(
+    df_serie: pd.DataFrame, horizonte: int = HORIZONTE_DIAS
+) -> dict:
+    """
+    Genera forecast usando transferencia de patrones estacionales de H&M,
+    calibrados a la escala real de DTF Fashion.
+    """
+    log.info("─── Generando Forecast por Transferencia H&M ───")
+
+    serie = df_serie[["fecha", "unidades"]].copy()
+    dias_activos = serie[serie["unidades"] > 0]
+
+    if len(dias_activos) == 0:
+        return {"status": "skip", "razon": "sin ventas registradas"}
+
+    promedio_diario = dias_activos["unidades"].mean()
+    ultima_fecha = pd.to_datetime(serie["fecha"].max())
+
+    # Calcular correcciones propias por mes (si hay datos)
+    correcciones = DTF_CORRECCION_MENSUAL.copy()
+    serie["mes"] = pd.to_datetime(serie["fecha"]).dt.month
+    for mes, grupo in serie.groupby("mes"):
+        real_mes = grupo["unidades"].mean()
+        if real_mes > 0:
+            estimado = HM_INDICE_MENSUAL.get(mes, 1.0) * promedio_diario
+            if estimado > 0:
+                correcciones[mes] = real_mes / estimado
+
+    # Generar forecast
+    fechas_futuras = []
+    predicciones = []
+    for i in range(horizonte):
+        fecha = ultima_fecha + pd.Timedelta(days=i + 1)
+        dia_sem = fecha.dayofweek
+        mes = fecha.month
+
+        idx_sem = HM_INDICE_SEMANAL.get(dia_sem, 1.0)
+        idx_mes = HM_INDICE_MENSUAL.get(mes, 1.0)
+        corr = correcciones.get(mes, 1.0)
+
+        pred = promedio_diario * idx_sem * idx_mes * corr
+        pred = max(0, pred)
+
+        fechas_futuras.append(fecha)
+        predicciones.append(pred)
+
+    forecast = np.array(predicciones)
+
+    # Evaluar sobre datos históricos (backtest)
+    if len(serie) >= horizonte:
+        backtest_real = serie["unidades"].values[-horizonte:]
+        backtest_pred = []
+        for i, row in serie.tail(horizonte).iterrows():
+            f = pd.to_datetime(row["fecha"])
+            ds = f.dayofweek
+            m = f.month
+            bp = promedio_diario * HM_INDICE_SEMANAL.get(ds, 1.0) * HM_INDICE_MENSUAL.get(m, 1.0) * correcciones.get(m, 1.0)
+            backtest_pred.append(max(0, bp))
+        metricas = calcular_metricas(backtest_real, np.array(backtest_pred))
+    else:
+        metricas = {"mae": 0, "mape": 0, "r2": 0}
+
+    log.info(f"  → Promedio diario DTF: {promedio_diario:.2f} uds")
+    log.info(f"  → Forecast 30d total: {forecast.sum():.0f} uds (central)")
+    log.info(f"  → MAE backtest: {metricas['mae']:.2f} | MAPE: {metricas['mape']:.1f}%")
+
+    return {
+        "status": "ok",
+        "nombre": "Transferencia H&M",
+        "metricas": metricas,
+        "forecast": forecast,
+        "fechas": fechas_futuras,
+        "parametros": f"prom_diario={promedio_diario:.2f}, corr_propia=True",
+        "promedio_diario": promedio_diario,
+        "correcciones": correcciones,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COMPARACIÓN Y SELECCIÓN
+# ═══════════════════════════════════════════════════════════════════════════
+
+def comparar_modelos(resultados: list, baseline: dict) -> dict:
+    """
+    Compara modelos entrenados, selecciona ganador, calcula mejora vs baseline.
+    """
+    log.info("═══ COMPARACIÓN DE MODELOS ═══")
+
+    modelos_ok = [r for r in resultados if r.get("status") == "ok"]
+    if not modelos_ok:
+        log.error("  → Ningún modelo se entrenó exitosamente")
+        return {"ganador": None, "comparacion": [], "baseline": baseline}
+
+    comparacion = []
+    for m in modelos_ok:
+        met = m["metricas"]
+        mejora_mae = ((baseline["mae"] - met["mae"]) / baseline["mae"] * 100) if baseline["mae"] > 0 else 0
+
+        info = {
+            "nombre": m["nombre"],
+            "mae": met["mae"],
+            "mape": met["mape"],
+            "r2": met["r2"],
+            "mejora_vs_baseline_pct": round(mejora_mae, 1),
+            "cumple_objetivo": mejora_mae >= 20,
+        }
+        comparacion.append(info)
+
+        log.info(
+            f"  {m['nombre']:20s} | MAE: {met['mae']:8.2f} | "
+            f"MAPE: {met['mape']:6.1f}% | R²: {met['r2']:6.3f} | "
+            f"Mejora: {mejora_mae:+.1f}%"
+        )
+
+    # Seleccionar ganador por menor MAPE (métrica principal del proyecto)
+    comparacion.sort(key=lambda x: x["mape"])
+    ganador = comparacion[0]
+
+    log.info(f"\n  🏆 GANADOR: {ganador['nombre']} (MAPE: {ganador['mape']:.1f}%)")
+    log.info(f"  📊 Baseline naive MAE: {baseline['mae']:.2f} | MAPE: {baseline['mape']:.1f}%")
+    log.info(f"  📈 Mejora vs baseline: {ganador['mejora_vs_baseline_pct']:+.1f}%")
+
+    return {
+        "ganador": ganador["nombre"],
+        "comparacion": comparacion,
+        "baseline": baseline,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ESCRITURA A POSTGRESQL
+# ═══════════════════════════════════════════════════════════════════════════
+
+def guardar_resultados(
+    resultados: list,
+    comparacion: dict,
+    df_serie: pd.DataFrame,
+) -> str:
+    """Guarda predicciones, métricas y training run a PostgreSQL."""
+    log.info("Guardando resultados a base de datos...")
+    db = engine()
+    run_id = str(uuid.uuid4())[:8]
+    ahora = datetime.now()
+    ultima_fecha = pd.to_datetime(df_serie["fecha"].max())
+
+    # ── Training Run ──
+    run_data = pd.DataFrame([{
+        "run_id": run_id,
+        "fecha_ejecucion": ahora,
+        "modelo_ganador": comparacion.get("ganador", "N/A"),
+        "n_datos": len(df_serie),
+        "horizonte": HORIZONTE_DIAS,
+        "baseline_mae": comparacion["baseline"]["mae"],
+        "baseline_mape": comparacion["baseline"]["mape"],
+        "mejor_mae": comparacion["comparacion"][0]["mae"] if comparacion["comparacion"] else None,
+        "mejor_mape": comparacion["comparacion"][0]["mape"] if comparacion["comparacion"] else None,
+        "mejora_pct": comparacion["comparacion"][0]["mejora_vs_baseline_pct"] if comparacion["comparacion"] else None,
+        "created_at": ahora,
+    }])
+    write_dataframe(run_data, "training_runs", if_exists="append")
+    log.info(f"  → training_runs: run_id={run_id}")
+
+    # ── Métricas por modelo ──
+    metricas_rows = []
+    for m in [r for r in resultados if r.get("status") == "ok"]:
+        met = m["metricas"]
+        metricas_rows.append({
+            "run_id": run_id,
+            "modelo": m["nombre"],
+            "mae": met["mae"],
+            "mape": met["mape"],
+            "r2": met["r2"],
+            "parametros": m.get("parametros", ""),
+            "es_ganador": m["nombre"] == comparacion.get("ganador"),
+            "created_at": ahora,
+        })
+    if metricas_rows:
+        write_dataframe(pd.DataFrame(metricas_rows), "metricas_modelos", if_exists="append")
+        log.info(f"  → metricas_modelos: {len(metricas_rows)} modelos")
+
+    # ── Predicciones del modelo ganador ──
+    ganador_data = next(
+        (r for r in resultados if r.get("nombre") == comparacion.get("ganador")),
+        None,
+    )
+    if ganador_data and "forecast" in ganador_data:
+        forecast = ganador_data["forecast"]
+        fechas = [ultima_fecha + pd.Timedelta(days=i + 1) for i in range(len(forecast))]
+
+        pred_rows = []
+        for i, (fecha, pred) in enumerate(zip(fechas, forecast)):
+            pred_rows.append({
+                "run_id": run_id,
+                "modelo": ganador_data["nombre"],
+                "fecha_prediccion": fecha,
+                "unidades_predichas": round(float(pred), 2),
+                "banda_inferior": round(float(pred * (1 - BANDA_INCERTIDUMBRE)), 2),
+                "banda_superior": round(float(pred * (1 + BANDA_INCERTIDUMBRE)), 2),
+                "dia_horizonte": i + 1,
+                "created_at": ahora,
+            })
+
+        # También guardar predicciones de todos los modelos OK
+        for m in [r for r in resultados if r.get("status") == "ok" and r["nombre"] != ganador_data["nombre"]]:
+            fc = m["forecast"]
+            for i, (fecha, pred) in enumerate(zip(fechas[:len(fc)], fc)):
+                pred_rows.append({
+                    "run_id": run_id,
+                    "modelo": m["nombre"],
+                    "fecha_prediccion": fecha,
+                    "unidades_predichas": round(float(pred), 2),
+                    "banda_inferior": round(float(pred * (1 - BANDA_INCERTIDUMBRE)), 2),
+                    "banda_superior": round(float(pred * (1 + BANDA_INCERTIDUMBRE)), 2),
+                    "dia_horizonte": i + 1,
+                    "created_at": ahora,
+                })
+
+        # Limpiar predicciones anteriores
+        with db.begin() as conn:
+            conn.execute(text("DELETE FROM predicciones"))
+        write_dataframe(pd.DataFrame(pred_rows), "predicciones", if_exists="append")
+        log.info(f"  → predicciones: {len(pred_rows)} registros")
+
+    return run_id
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PIPELINE PRINCIPAL DE ENTRENAMIENTO
+# ═══════════════════════════════════════════════════════════════════════════
+
+def ejecutar_entrenamiento() -> dict:
+    """
+    Pipeline completo:
+      1. Lee datos de PostgreSQL (serie_semanal + features)
+      2. Entrena SARIMA, Prophet, Random Forest
+      3. Calcula baseline naive
+      4. Compara los 3 modelos
+      5. Guarda resultados a PostgreSQL
+
+    Los índices estacionales de retail se usan internamente como
+    features del Random Forest, no como modelo independiente.
 
     Returns:
-        dict con resumen de registros insertados y metadata
+        dict con resumen del entrenamiento
     """
     log.info("=" * 70)
-    log.info("INICIO PIPELINE ETL v4.0 — DTF Fashion")
+    log.info("INICIO ENTRENAMIENTO v4.0 — DTF Fashion")
     log.info("=" * 70)
     t0 = datetime.now()
 
-    # Paso 1: Cargar
-    df_raw = cargar_archivo(ruta_archivo)
+    # ── 1. Leer datos de PostgreSQL ──
+    log.info("Leyendo datos de PostgreSQL...")
+    try:
+        df_serie = read_sql("SELECT * FROM serie_semanal ORDER BY fecha")
+        df_features = read_sql("SELECT * FROM features ORDER BY fecha")
+    except Exception as e:
+        log.error(f"Error leyendo datos: {e}")
+        return {"status": "error", "mensaje": "No hay datos. Ejecuta primero el ETL."}
 
-    # Paso 2: Detectar columnas
-    mapeo = detectar_columnas(df_raw)
+    if df_serie.empty:
+        return {"status": "error", "mensaje": "Tabla serie_semanal vacía. Sube datos primero."}
 
-    # Paso 3: Limpiar
-    df_limpio = limpiar_datos(df_raw, mapeo)
+    df_serie["fecha"] = pd.to_datetime(df_serie["fecha"])
+    df_features["fecha"] = pd.to_datetime(df_features["fecha"])
+    serie = df_serie.set_index("fecha")["unidades"]
 
-    # Paso 4: Agregar serie diaria
-    df_serie = agregar_serie_semanal(df_limpio)
+    log.info(f"  → {len(df_serie)} días de datos")
+    log.info(f"  → {serie.sum():.0f} unidades totales")
 
-    # Paso 5: Features
-    df_features = generar_features(df_serie)
+    # ── 2. Baseline naive ──
+    baseline = calcular_baseline_naive(serie, HORIZONTE_DIAS)
+    log.info(f"\n📌 Baseline naive — MAE: {baseline['mae']:.2f} | MAPE: {baseline['mape']:.1f}%\n")
 
-    # Paso 6: Escribir a DB
-    resumen_db = escribir_a_db(df_limpio, df_serie, df_features)
+    # ── 3. Entrenar modelos ──
+    resultados = []
+
+    # SARIMA
+    res_sarima = entrenar_sarima(serie, HORIZONTE_DIAS)
+    resultados.append(res_sarima)
+
+    # Prophet
+    res_prophet = entrenar_prophet(df_serie, HORIZONTE_DIAS)
+    resultados.append(res_prophet)
+
+    # Random Forest (usa índices estacionales de retail como features internos)
+    res_rf = entrenar_random_forest(df_features, HORIZONTE_DIAS)
+    resultados.append(res_rf)
+
+    # ── 4. Comparar ──
+    comparacion = comparar_modelos(resultados, baseline)
+
+    # ── 5. Guardar a DB ──
+    run_id = guardar_resultados(resultados, comparacion, df_serie)
 
     elapsed = (datetime.now() - t0).total_seconds()
 
-    resultado = {
+    resumen = {
         "status": "ok",
-        "archivo": str(ruta_archivo),
-        "filas_crudas": len(df_raw),
-        "filas_limpias": len(df_limpio),
-        "dias_serie": len(df_serie),
-        "features_generados": len([
-            c for c in df_features.columns if c not in ("fecha", "unidades")
-        ]),
-        "periodo": {
-            "inicio": str(df_limpio["fecha"].min().date()),
-            "fin": str(df_limpio["fecha"].max().date()),
-        },
-        "unidades_totales": int(df_limpio["cantidad"].sum()),
-        "ingreso_total": float(df_limpio["ingreso_bruto"].sum()),
-        "registros_db": resumen_db,
+        "run_id": run_id,
+        "modelos_entrenados": [r["nombre"] for r in resultados if r.get("status") == "ok"],
+        "modelos_fallidos": [
+            {"nombre": r.get("nombre", "?"), "razon": r.get("razon", "")}
+            for r in resultados if r.get("status") != "ok"
+        ],
+        "ganador": comparacion.get("ganador"),
+        "comparacion": comparacion.get("comparacion", []),
+        "baseline": baseline,
+        "horizonte_dias": HORIZONTE_DIAS,
+        "banda_incertidumbre": BANDA_INCERTIDUMBRE,
         "tiempo_seg": round(elapsed, 2),
     }
 
     log.info("=" * 70)
-    log.info(f"PIPELINE COMPLETADO en {elapsed:.1f}s")
-    log.info(f"  Filas: {resultado['filas_crudas']} → {resultado['filas_limpias']}")
-    log.info(f"  Serie: {resultado['dias_serie']} días")
-    log.info(f"  Unidades: {resultado['unidades_totales']}")
+    log.info(f"ENTRENAMIENTO COMPLETADO en {elapsed:.1f}s")
+    log.info(f"  Run ID: {run_id}")
+    log.info(f"  Ganador: {comparacion.get('ganador')}")
     log.info("=" * 70)
 
-    return resultado
+    return resumen
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -525,12 +751,12 @@ def ejecutar_pipeline(ruta_archivo: str) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Uso: python etl_pipeline.py <ruta_archivo.xlsx|csv>")
-        print("Ejemplo: python etl_pipeline.py data/ventas_dtf.xlsx")
-        sys.exit(1)
-
-    resultado = ejecutar_pipeline(sys.argv[1])
+    resultado = ejecutar_entrenamiento()
     print("\n✅ Resultado:")
     for k, v in resultado.items():
-        print(f"  {k}: {v}")
+        if k != "comparacion":
+            print(f"  {k}: {v}")
+    print("\n📊 Comparación de modelos:")
+    for m in resultado.get("comparacion", []):
+        flag = "🏆" if m["nombre"] == resultado.get("ganador") else "  "
+        print(f"  {flag} {m['nombre']:20s} | MAE: {m['mae']:.2f} | MAPE: {m['mape']:.1f}% | Mejora: {m['mejora_vs_baseline_pct']:+.1f}%")

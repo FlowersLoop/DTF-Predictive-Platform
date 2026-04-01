@@ -87,6 +87,18 @@ def cargar_archivo(ruta: str) -> pd.DataFrame:
     ext = ruta.suffix.lower()
     if ext in (".xlsx", ".xls"):
         df = pd.read_excel(ruta)
+        # Detectar si los headers están mal (todas las columnas son "Unnamed")
+        if all("Unnamed" in str(c) or "unnamed" in str(c) for c in df.columns):
+            log.warning("  → Headers no detectados en fila 0, buscando fila de headers...")
+            for skip in range(1, 6):
+                df_test = pd.read_excel(ruta, skiprows=skip)
+                unnamed_count = sum(1 for c in df_test.columns if "Unnamed" in str(c) or "unnamed" in str(c))
+                if unnamed_count < len(df_test.columns) * 0.5:
+                    df = df_test
+                    log.info(f"  → Headers encontrados en fila {skip + 1}")
+                    break
+        # Eliminar columnas completamente vacías
+        df = df.dropna(axis=1, how="all")
     elif ext == ".csv":
         # Intentar detectar separador
         for sep in [",", ";", "\t", "|"]:
@@ -121,17 +133,34 @@ def cargar_archivo(ruta: str) -> pd.DataFrame:
 
 
 def detectar_columnas(df: pd.DataFrame) -> dict:
-    """Detecta automáticamente qué columnas corresponden a fecha, cantidad, precio, etc."""
+    """
+    Detecta automáticamente qué columnas corresponden a fecha, cantidad, precio, etc.
+    Soporta formato Shopify (Date, Quantity, Total, Product, Category)
+    y formato libre en español (fecha, cantidad, precio, producto, categoria).
+    """
     mapeo = {}
 
-    # Fecha
+    # ── Fecha ──
+    fecha_keywords = ["date", "fecha", "t_dat", "created_at", "order_date", "fecha_de_venta"]
+    excluir_fecha = {"dia_semana", "dia_nombre", "dias_desde_inicio", "update_date"}
+    # Match exacto primero
     for col in df.columns:
-        if any(k in col for k in ["fecha", "date", "dia", "t_dat"]):
+        if col in fecha_keywords:
             mapeo["fecha"] = col
             break
+    # Substring match
     if "fecha" not in mapeo:
-        # Buscar columna con datos tipo datetime
         for col in df.columns:
+            if col in excluir_fecha:
+                continue
+            if any(k in col for k in ["fecha", "date", "t_dat"]):
+                mapeo["fecha"] = col
+                break
+    # Último recurso: columna con tipo datetime
+    if "fecha" not in mapeo:
+        for col in df.columns:
+            if col in excluir_fecha:
+                continue
             try:
                 parsed = pd.to_datetime(df[col], errors="coerce")
                 if parsed.notna().sum() > len(df) * 0.5:
@@ -140,27 +169,35 @@ def detectar_columnas(df: pd.DataFrame) -> dict:
             except Exception:
                 continue
 
-    # Cantidad / unidades
+    # ── Cantidad ──
     for col in df.columns:
-        if any(k in col for k in ["cantidad", "unidades", "qty", "quantity", "units"]):
+        if any(k == col or k in col for k in ["quantity", "cantidad", "unidades", "qty", "units", "lineitem_quantity"]):
             mapeo["cantidad"] = col
             break
 
-    # Precio
-    for col in df.columns:
-        if any(k in col for k in ["precio", "price", "monto", "total", "ingreso", "revenue"]):
-            mapeo["precio"] = col
+    # ── Precio / Total ──
+    # Priorizar "total" sobre "subtotal" sobre "ingreso/precio"
+    precio_prioridad = [
+        ["total", "total_neto"],
+        ["subtotal", "precio", "price", "ingreso", "revenue", "monto", "lineitem_price"],
+    ]
+    for grupo in precio_prioridad:
+        if "precio" in mapeo:
             break
+        for col in df.columns:
+            if any(k == col or k in col for k in grupo):
+                mapeo["precio"] = col
+                break
 
-    # Producto / diseño
+    # ── Producto / diseño ──
     for col in df.columns:
-        if any(k in col for k in ["producto", "diseno", "design", "sku", "article", "nombre"]):
+        if any(k == col or k in col for k in ["product", "producto", "diseno", "design", "sku", "article", "nombre", "lineitem_name"]):
             mapeo["producto"] = col
             break
 
-    # Categoría
+    # ── Categoría ──
     for col in df.columns:
-        if any(k in col for k in ["categoria", "category", "tipo", "type", "linea"]):
+        if any(k == col or k in col for k in ["category", "categoria", "linea", "product_type"]):
             mapeo["categoria"] = col
             break
 
@@ -181,7 +218,34 @@ def limpiar_datos(df: pd.DataFrame, mapeo: dict) -> pd.DataFrame:
     col_fecha = mapeo.get("fecha")
     if col_fecha is None:
         raise ValueError("No se detectó columna de fecha. Asegúrate de tener una columna 'fecha' o 'date'.")
+
+    # Intentar parseo directo
     df["fecha"] = pd.to_datetime(df[col_fecha], errors="coerce", dayfirst=True)
+
+    # Si falló (muchos NaT), intentar como serial date de Excel (ej: 45930 = 2025-10-06)
+    nulos = df["fecha"].isna().sum()
+    if nulos > len(df) * 0.5:
+        log.warning(f"  → {nulos} fechas no parseadas, intentando como serial Excel...")
+        vals = pd.to_numeric(df[col_fecha], errors="coerce")
+        if vals.notna().sum() > len(df) * 0.5 and vals.median() > 40000:
+            df["fecha"] = pd.to_datetime(vals, unit="D", origin="1899-12-30", errors="coerce")
+            log.info(f"  → Convertidas {df['fecha'].notna().sum()} fechas desde serial Excel")
+
+    # Si las fechas son epoch/sospechosas (1970), el mapeo detectó la columna equivocada
+    if df["fecha"].notna().any() and df["fecha"].min().year < 2000:
+        log.warning(f"  → Fechas sospechosas (año {df['fecha'].min().year}), buscando otra columna...")
+        for col in df.columns:
+            if col == col_fecha:
+                continue
+            try:
+                test = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
+                if test.notna().sum() > len(df) * 0.5 and test.min().year >= 2020:
+                    df["fecha"] = test
+                    log.info(f"  → Columna de fecha corregida a: '{col}'")
+                    break
+            except Exception:
+                continue
+
     nulos_fecha = df["fecha"].isna().sum()
     if nulos_fecha > 0:
         log.warning(f"  → {nulos_fecha} filas con fecha inválida eliminadas")

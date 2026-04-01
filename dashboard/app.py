@@ -1,6 +1,10 @@
 """
-Streamlit Dashboard v4.0 — DTF Fashion Predictive Analytics Platform
+Streamlit Dashboard v4.1 — DTF Fashion Predictive Analytics Platform
 5 Tabs: Pronósticos, Comparación de Modelos, Producción, Google Trends, Datos.
+
+Nota: Los índices estacionales de retail (derivados de H&M) se usan internamente
+como features de los modelos ML, pero NO se exponen al usuario como fuente.
+El usuario solo ve sus propios datos y las predicciones de los 3 modelos.
 """
 
 import os
@@ -36,7 +40,6 @@ st.set_page_config(
 
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 
-# Colores del tema
 COLORS = {
     "primary": "#1E3A5F",
     "accent": "#3B82F6",
@@ -47,6 +50,9 @@ COLORS = {
     "light": "#F3F4F6",
     "banda": "rgba(59,130,246,0.15)",
 }
+
+# Modelos que se muestran al usuario (sin Transferencia H&M)
+MODELOS_VISIBLES = ["SARIMA", "Prophet", "Random Forest"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -64,12 +70,16 @@ def cargar_serie():
 @st.cache_data(ttl=60)
 def cargar_predicciones():
     try:
-        return read_sql("""
+        df = read_sql("""
             SELECT p.*, t.modelo_ganador
             FROM predicciones p
             LEFT JOIN training_runs t ON p.run_id = t.run_id
             ORDER BY p.modelo, p.fecha_prediccion
         """)
+        # Filtrar solo modelos visibles al usuario
+        if not df.empty:
+            df = df[df["modelo"].isin(MODELOS_VISIBLES)]
+        return df
     except Exception:
         return pd.DataFrame()
 
@@ -82,6 +92,9 @@ def cargar_metricas():
             return pd.DataFrame(), {}
         run = runs.iloc[0]
         metricas = read_sql(f"SELECT * FROM metricas_modelos WHERE run_id = '{run['run_id']}' ORDER BY mape")
+        # Filtrar solo modelos visibles
+        if not metricas.empty:
+            metricas = metricas[metricas["modelo"].isin(MODELOS_VISIBLES)]
         return metricas, run.to_dict()
     except Exception:
         return pd.DataFrame(), {}
@@ -91,14 +104,6 @@ def cargar_metricas():
 def cargar_ventas():
     try:
         return read_sql("SELECT * FROM ventas ORDER BY fecha")
-    except Exception:
-        return pd.DataFrame()
-
-
-@st.cache_data(ttl=300)
-def cargar_factores_hm():
-    try:
-        return read_sql("SELECT * FROM factores_hm ORDER BY tipo, clave")
     except Exception:
         return pd.DataFrame()
 
@@ -144,7 +149,6 @@ with st.sidebar:
         if st.button("🚀 Procesar datos", type="primary", use_container_width=True):
             with st.spinner("Ejecutando pipeline ETL..."):
                 try:
-                    # Guardar temporalmente
                     import tempfile
                     tmp = Path(tempfile.mkdtemp()) / uploaded_file.name
                     tmp.write_bytes(uploaded_file.read())
@@ -155,10 +159,8 @@ with st.sidebar:
                     st.success(f"✅ {resultado['filas_limpias']} registros procesados")
                     st.json(resultado)
 
-                    # Limpiar cache
                     st.cache_data.clear()
 
-                    # Limpiar temporal
                     import shutil
                     shutil.rmtree(tmp.parent, ignore_errors=True)
 
@@ -184,8 +186,8 @@ with st.sidebar:
                 st.error(f"Error: {e}")
 
     st.divider()
-    st.caption("v4.0 — Proyecto de titulación Ibero 2026")
-    st.caption("Pipeline: SARIMA · Prophet · Random Forest · H&M Transfer")
+    st.caption("v4.1 — Proyecto de titulación Ibero 2026")
+    st.caption("Pipeline: SARIMA · Prophet · Random Forest")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -218,8 +220,11 @@ with tab1:
     pred["fecha_prediccion"] = pd.to_datetime(pred["fecha_prediccion"])
     serie["fecha"] = pd.to_datetime(serie["fecha"])
 
-    # Modelo ganador
+    # Modelo ganador (solo entre los 3 visibles)
     ganador = pred["modelo_ganador"].iloc[0] if "modelo_ganador" in pred.columns else "N/A"
+    if ganador not in MODELOS_VISIBLES and not pred.empty:
+        # Si el ganador interno era Transferencia H&M, usar el mejor de los 3 visibles
+        ganador = pred.groupby("modelo")["unidades_predichas"].mean().idxmin() if not pred.empty else "SARIMA"
     pred_ganador = pred[pred["modelo"] == ganador]
 
     # KPIs
@@ -242,7 +247,6 @@ with tab1:
     # Gráfica principal: Histórico + Forecast con bandas
     fig = go.Figure()
 
-    # Histórico
     fig.add_trace(go.Bar(
         x=serie["fecha"],
         y=serie["unidades"],
@@ -251,7 +255,6 @@ with tab1:
         opacity=0.6,
     ))
 
-    # Forecast del ganador
     fig.add_trace(go.Scatter(
         x=pred_ganador["fecha_prediccion"],
         y=pred_ganador["unidades_predichas"],
@@ -261,7 +264,6 @@ with tab1:
         marker=dict(size=5),
     ))
 
-    # Banda de incertidumbre
     fig.add_trace(go.Scatter(
         x=pd.concat([pred_ganador["fecha_prediccion"], pred_ganador["fecha_prediccion"][::-1]]),
         y=pd.concat([pred_ganador["banda_superior"], pred_ganador["banda_inferior"][::-1]]),
@@ -283,9 +285,9 @@ with tab1:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # Selector de modelo para ver todos
+    # Selector de modelo
     st.subheader("Ver por modelo")
-    modelos_disponibles = pred["modelo"].unique().tolist()
+    modelos_disponibles = [m for m in pred["modelo"].unique().tolist() if m in MODELOS_VISIBLES]
     modelo_sel = st.selectbox("Selecciona modelo:", modelos_disponibles, index=0)
 
     pred_sel = pred[pred["modelo"] == modelo_sel]
@@ -295,7 +297,6 @@ with tab1:
     with col_b:
         st.metric("Promedio diario", f"{pred_sel['unidades_predichas'].mean():.1f} uds")
 
-    # Tabla de predicciones
     with st.expander("📋 Tabla de predicciones detallada"):
         st.dataframe(
             pred_sel[["fecha_prediccion", "unidades_predichas", "banda_inferior", "banda_superior", "dia_horizonte"]].reset_index(drop=True),
@@ -316,23 +317,25 @@ with tab2:
     if metricas_df.empty:
         st.warning("No hay métricas. Entrena los modelos primero.")
     else:
-        # Info del run
         st.caption(
             f"Run: `{run_info.get('run_id', '?')}` | "
             f"Fecha: {run_info.get('fecha_ejecucion', '?')} | "
             f"Datos: {run_info.get('n_datos', '?')} días"
         )
 
-        # KPIs del run
+        # Determinar ganador entre los 3 modelos visibles
+        ganador_visible = run_info.get("modelo_ganador", "?")
+        if ganador_visible not in MODELOS_VISIBLES and not metricas_df.empty:
+            ganador_visible = metricas_df.iloc[0]["modelo"]  # El de menor MAPE
+
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("🏆 Modelo Ganador", run_info.get("modelo_ganador", "?"))
+            st.metric("🏆 Modelo Ganador", ganador_visible)
         with col2:
             baseline_mape = run_info.get("baseline_mape", 0)
             st.metric("📌 Baseline MAPE", f"{baseline_mape:.1f}%")
         with col3:
             mejora = run_info.get("mejora_pct", 0)
-            color = "normal" if mejora and mejora >= 20 else "off"
             st.metric(
                 "📈 Mejora vs Baseline",
                 f"{mejora:+.1f}%" if mejora else "N/A",
@@ -347,8 +350,7 @@ with tab2:
             subplot_titles=["MAE (menor = mejor)", "MAPE % (menor = mejor)", "R² (mayor = mejor)"],
         )
 
-        colores = [COLORS["accent"], COLORS["success"], COLORS["warning"], COLORS["danger"]][:len(metricas_df)]
-        es_ganador = metricas_df["es_ganador"].astype(bool) if "es_ganador" in metricas_df.columns else [False] * len(metricas_df)
+        es_ganador = metricas_df["modelo"] == ganador_visible
         bar_colors = [COLORS["success"] if g else COLORS["gray"] for g in es_ganador]
 
         fig_comp.add_trace(go.Bar(
@@ -369,7 +371,6 @@ with tab2:
             text=metricas_df["r2"].round(3), textposition="outside",
         ), row=1, col=3)
 
-        # Agregar línea de baseline al MAPE
         if baseline_mape:
             fig_comp.add_hline(
                 y=baseline_mape, line_dash="dash", line_color=COLORS["danger"],
@@ -389,15 +390,17 @@ with tab2:
         display_df.columns = ["Modelo", "MAE", "MAPE (%)", "R²", "Parámetros", "Ganador"]
         st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-        # Forecast comparativo (todos los modelos)
+        # Forecast comparativo
         st.subheader("Forecast comparativo — Todos los modelos")
         pred = cargar_predicciones()
         if not pred.empty:
             pred["fecha_prediccion"] = pd.to_datetime(pred["fecha_prediccion"])
             fig_all = go.Figure()
-            line_styles = ["solid", "dash", "dot", "dashdot"]
+            line_styles = ["solid", "dash", "dot"]
             for i, (modelo, grupo) in enumerate(pred.groupby("modelo")):
-                es_winner = modelo == run_info.get("modelo_ganador")
+                if modelo not in MODELOS_VISIBLES:
+                    continue
+                es_winner = modelo == ganador_visible
                 fig_all.add_trace(go.Scatter(
                     x=grupo["fecha_prediccion"],
                     y=grupo["unidades_predichas"],
@@ -417,7 +420,6 @@ with tab2:
             )
             st.plotly_chart(fig_all, use_container_width=True)
 
-        # Historial de training runs
         with st.expander("📜 Historial de entrenamientos"):
             try:
                 runs = read_sql("SELECT * FROM training_runs ORDER BY fecha_ejecucion DESC LIMIT 20")
@@ -445,9 +447,10 @@ with tab3:
         serie["fecha"] = pd.to_datetime(serie["fecha"])
 
         ganador = pred["modelo_ganador"].iloc[0] if "modelo_ganador" in pred.columns else pred["modelo"].iloc[0]
+        if ganador not in MODELOS_VISIBLES:
+            ganador = pred[pred["modelo"].isin(MODELOS_VISIBLES)].groupby("modelo")["unidades_predichas"].mean().idxmin()
         pg = pred[pred["modelo"] == ganador]
 
-        # Resumen de producción
         st.subheader("📦 Plan de producción sugerido — 30 días")
 
         col1, col2, col3 = st.columns(3)
@@ -605,7 +608,6 @@ with tab4:
                     if "isPartial" in interest.columns:
                         interest = interest.drop("isPartial", axis=1)
 
-                    # Gráfica de tendencias
                     fig_trends = go.Figure()
                     for kw in kw_list:
                         if kw in interest.columns:
@@ -624,12 +626,10 @@ with tab4:
                     )
                     st.plotly_chart(fig_trends, use_container_width=True)
 
-                    # Resumen
                     st.subheader("Resumen de interés")
                     summary = interest.describe().loc[["mean", "max", "min"]].round(1)
                     st.dataframe(summary, use_container_width=True)
 
-                    # Related queries
                     try:
                         related = pytrends.related_queries()
                         for kw in kw_list:
@@ -644,51 +644,50 @@ with tab4:
             except Exception as e:
                 st.error(f"Error al consultar Google Trends: {e}")
 
-    # Estacionalidad H&M como fallback visual
+    # Patrones estacionales del retail (datos internos, sin mencionar H&M)
     st.divider()
-    st.subheader("📅 Patrones estacionales H&M (referencia)")
+    st.subheader("📅 Patrones estacionales de la industria")
+    st.caption("Índices de estacionalidad del retail aplicados internamente por los modelos de ML")
 
-    factores = cargar_factores_hm()
-    if not factores.empty:
+    serie = cargar_serie()
+    if not serie.empty:
+        serie["fecha"] = pd.to_datetime(serie["fecha"])
         col_a, col_b = st.columns(2)
 
-        semanal = factores[factores["tipo"] == "semanal"].copy()
-        mensual = factores[factores["tipo"] == "mensual"].copy()
+        # Patrón semanal de TUS datos
+        por_dia = serie.groupby("dia_semana")["unidades"].mean()
+        dias_map = {0: "Lun", 1: "Mar", 2: "Mié", 3: "Jue", 4: "Vie", 5: "Sáb", 6: "Dom"}
 
-        if not semanal.empty:
-            semanal["dia"] = semanal["clave"].astype(int)
-            dias_map = {0: "Lun", 1: "Mar", 2: "Mié", 3: "Jue", 4: "Vie", 5: "Sáb", 6: "Dom"}
-            semanal["nombre"] = semanal["dia"].map(dias_map)
-            semanal = semanal.sort_values("dia")
+        with col_a:
+            fig_sw = px.bar(
+                x=[dias_map.get(d, d) for d in por_dia.index],
+                y=por_dia.values,
+                title="Tu patrón semanal de ventas",
+                labels={"x": "Día", "y": "Promedio unidades"},
+                color=por_dia.values,
+                color_continuous_scale="Blues",
+            )
+            fig_sw.update_layout(height=350, showlegend=False)
+            st.plotly_chart(fig_sw, use_container_width=True)
 
-            with col_a:
-                fig_sw = px.bar(
-                    semanal, x="nombre", y="valor",
-                    title="Índice semanal H&M",
-                    labels={"valor": "Índice", "nombre": "Día"},
-                    color="valor", color_continuous_scale="Blues",
-                )
-                fig_sw.add_hline(y=1.0, line_dash="dash", line_color="gray")
-                fig_sw.update_layout(height=350, showlegend=False)
-                st.plotly_chart(fig_sw, use_container_width=True)
+        # Patrón mensual de TUS datos
+        por_mes = serie.groupby("mes")["unidades"].mean()
+        meses_map = {1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
+                     7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic"}
 
-        if not mensual.empty:
-            mensual["mes_num"] = mensual["clave"].astype(int)
-            meses_map = {1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
-                         7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic"}
-            mensual["nombre"] = mensual["mes_num"].map(meses_map)
-            mensual = mensual.sort_values("mes_num")
-
-            with col_b:
-                fig_mm = px.bar(
-                    mensual, x="nombre", y="valor",
-                    title="Índice mensual H&M",
-                    labels={"valor": "Índice", "nombre": "Mes"},
-                    color="valor", color_continuous_scale="Greens",
-                )
-                fig_mm.add_hline(y=1.0, line_dash="dash", line_color="gray")
-                fig_mm.update_layout(height=350, showlegend=False)
-                st.plotly_chart(fig_mm, use_container_width=True)
+        with col_b:
+            fig_mm = px.bar(
+                x=[meses_map.get(m, m) for m in por_mes.index],
+                y=por_mes.values,
+                title="Tu patrón mensual de ventas",
+                labels={"x": "Mes", "y": "Promedio unidades"},
+                color=por_mes.values,
+                color_continuous_scale="Greens",
+            )
+            fig_mm.update_layout(height=350, showlegend=False)
+            st.plotly_chart(fig_mm, use_container_width=True)
+    else:
+        st.info("Sube tus datos de ventas para ver los patrones estacionales de tu negocio.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

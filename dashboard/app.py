@@ -132,6 +132,42 @@ footer {{visibility: hidden;}}
     background-color: {_C["_bg"]} !important;
 }}
 
+/* ── COLOR DE TEXTO GLOBAL ───────────────────────────────────────────────────
+   Pisa el textColor de config.toml (que siempre es el valor dark #E8E4DC).
+   Se aplica a todos los elementos de texto nativos de Streamlit. */
+body,
+p,
+li,
+span:not(.badge-ok):not(.badge-warn):not(.badge-danger):not(.alerta-titulo):not(.ts-label),
+.stMarkdown,
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] li,
+[data-testid="stMarkdownContainer"] span,
+[data-testid="stText"],
+[data-testid="stWidgetLabel"],
+[data-testid="stCaptionContainer"],
+[data-testid="stSelectbox"] *,
+[data-testid="stMultiSelect"] *,
+[data-testid="stSlider"] *,
+[data-testid="stCheckbox"] *,
+[data-testid="stRadio"] *,
+[data-testid="stNumberInput"] *,
+[data-testid="stTextInput"] *,
+[data-testid="stFileUploader"] *,
+[data-testid="stDataFrame"] td,
+[data-testid="stDataFrame"] th,
+[data-baseweb="tab"] span,
+table td, table th {{
+    color: {_C["text"]} !important;
+}}
+/* Sidebar texto nativo */
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] span:not(.badge-ok):not(.badge-warn):not(.badge-danger),
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] {{
+    color: {_C["text"]} !important;
+}}
+
 /* Contenedor principal */
 .main .block-container {{
     padding-top: 2rem;
@@ -466,8 +502,8 @@ def ganador_visible(pred, metricas_df, run_info):
 with st.sidebar:
     st.markdown("### DTF Fashion")
     st.markdown(
-        '<span style="font-size:0.75rem;letter-spacing:0.08em;'
-        'text-transform:uppercase;color:#8A8898;">Plataforma de demanda</span>',
+        f'<span style="font-size:0.75rem;letter-spacing:0.08em;'
+        f'text-transform:uppercase;color:{COLORS["muted"]};">Plataforma de demanda</span>',
         unsafe_allow_html=True,
     )
     st.divider()
@@ -494,8 +530,8 @@ with st.sidebar:
     st.divider()
 
     st.markdown(
-        '<span style="font-size:0.72rem;letter-spacing:0.1em;'
-        'text-transform:uppercase;color:#8A8898;">Cargar ventas</span>',
+        f'<span style="font-size:0.72rem;letter-spacing:0.1em;'
+        f'text-transform:uppercase;color:{COLORS["muted"]};">Cargar ventas</span>',
         unsafe_allow_html=True,
     )
     uploaded_file = st.file_uploader(
@@ -524,8 +560,8 @@ with st.sidebar:
     st.divider()
 
     st.markdown(
-        '<span style="font-size:0.72rem;letter-spacing:0.1em;'
-        'text-transform:uppercase;color:#8A8898;">Actualizar pronósticos</span>',
+        f'<span style="font-size:0.72rem;letter-spacing:0.1em;'
+        f'text-transform:uppercase;color:{COLORS["muted"]};">Actualizar pronósticos</span>',
         unsafe_allow_html=True,
     )
     if st.button("Ejecutar análisis de modelos", use_container_width=True):

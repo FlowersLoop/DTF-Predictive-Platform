@@ -38,29 +38,69 @@ st.set_page_config(
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PALETA Y ESTILOS
+# TEMA — estado persistente entre reruns
 # ─────────────────────────────────────────────────────────────────────────────
 
-COLORS = {
-    "gold":     "#C2A87A",
-    "gold_dim": "rgba(194,168,122,0.15)",
-    "teal":     "#4E9E8A",
-    "teal_dim": "rgba(78,158,138,0.15)",
-    "amber":    "#C4936A",
-    "red":      "#B05C5C",
-    "surface":  "#16161E",
-    "border":   "#2A2A38",
-    "text":     "#E8E4DC",
-    "muted":    "#8A8898",
-    "banda":    "rgba(194,168,122,0.12)",
-}
+if "tema" not in st.session_state:
+    st.session_state.tema = "dark"
+
+ES_OSCURO = st.session_state.tema == "dark"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PALETA Y ESTILOS — dinámicos según el tema activo
+# ─────────────────────────────────────────────────────────────────────────────
+
+if ES_OSCURO:
+    COLORS = {
+        "gold":        "#C2A87A",
+        "gold_dim":    "rgba(194,168,122,0.15)",
+        "teal":        "#4E9E8A",
+        "teal_dim":    "rgba(78,158,138,0.15)",
+        "amber":       "#C4936A",
+        "red":         "#B05C5C",
+        "surface":     "#16161E",
+        "border":      "#2A2A38",
+        "text":        "#E8E4DC",
+        "muted":       "#8A8898",
+        "banda":       "rgba(194,168,122,0.12)",
+        # internos CSS
+        "_bg":         "#0C0C10",
+        "_sidebar":    "#0F0F14",
+        "_plot":       "rgba(22,22,30,0.6)",
+        "_h2":         "#C2A87A",
+        "_h3":         "#E8E4DC",
+        "_tab_active": "#C2A87A",
+        "_template":   "plotly_dark",
+    }
+else:
+    COLORS = {
+        "gold":        "#8B6310",
+        "gold_dim":    "rgba(139,99,16,0.12)",
+        "teal":        "#2D7A68",
+        "teal_dim":    "rgba(45,122,104,0.12)",
+        "amber":       "#A0622A",
+        "red":         "#8B3A3A",
+        "surface":     "#EEE9E2",
+        "border":      "#D4CFC7",
+        "text":        "#1C1C28",
+        "muted":       "#7A7060",
+        "banda":       "rgba(139,99,16,0.10)",
+        # internos CSS
+        "_bg":         "#FAF8F4",
+        "_sidebar":    "#EAE5DD",
+        "_plot":       "rgba(240,236,229,0.6)",
+        "_h2":         "#8B6310",
+        "_h3":         "#1C1C28",
+        "_tab_active": "#8B6310",
+        "_template":   "plotly_white",
+    }
 
 MODELOS_VISIBLES = ["SARIMA", "Prophet", "Random Forest"]
 
 CHART_LAYOUT = dict(
-    template="plotly_dark",
+    template=COLORS["_template"],
     paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="rgba(22,22,30,0.6)",
+    plot_bgcolor=COLORS["_plot"],
     font=dict(family="sans-serif", color=COLORS["text"], size=12),
     xaxis=dict(gridcolor=COLORS["border"], linecolor=COLORS["border"]),
     yaxis=dict(gridcolor=COLORS["border"], linecolor=COLORS["border"]),
@@ -73,242 +113,257 @@ LEGEND_DEFAULT = dict(bgcolor="rgba(0,0,0,0)", bordercolor=COLORS["border"])
 LEGEND_TOP = dict(bgcolor="rgba(0,0,0,0)", bordercolor=COLORS["border"],
                   orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
 
-st.markdown("""
+_C = COLORS  # alias corto para el bloque CSS
+st.markdown(f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
 
-html, body, [class*="css"] {
+html, body, [class*="css"] {{
     font-family: 'Inter', sans-serif;
-}
+}}
 
 /* Ocultar elementos de Streamlit */
-#MainMenu {visibility: hidden;}
-footer {visibility: hidden;}
-[data-testid="stDecoration"] {display: none;}
+#MainMenu {{visibility: hidden;}}
+footer {{visibility: hidden;}}
+[data-testid="stDecoration"] {{display: none;}}
 
+/* Fondo global */
+.stApp {{
+    background-color: {_C["_bg"]} !important;
+}}
 
 /* Contenedor principal */
-.main .block-container {
+.main .block-container {{
     padding-top: 2rem;
     padding-bottom: 3rem;
     max-width: 1440px;
-}
+    background: transparent;
+}}
 
 /* Métricas */
-[data-testid="stMetric"] {
-    background: #16161E;
-    border: 1px solid #2A2A38;
+[data-testid="stMetric"] {{
+    background: {_C["surface"]};
+    border: 1px solid {_C["border"]};
     border-radius: 2px;
     padding: 1.2rem 1.4rem;
-}
-[data-testid="stMetricLabel"] {
+}}
+[data-testid="stMetricLabel"] {{
     font-size: 0.72rem;
     letter-spacing: 0.1em;
     text-transform: uppercase;
-    color: #8A8898 !important;
+    color: {_C["muted"]} !important;
     font-weight: 500;
-}
-[data-testid="stMetricValue"] {
+}}
+[data-testid="stMetricValue"] {{
     font-size: 1.8rem;
     font-weight: 300;
-    color: #E8E4DC !important;
-}
-[data-testid="stMetricDelta"] {
+    color: {_C["text"]} !important;
+}}
+[data-testid="stMetricDelta"] {{
     font-size: 0.78rem;
-}
+}}
 
 /* Tabs */
-[data-testid="stTabs"] [data-baseweb="tab-list"] {
+[data-testid="stTabs"] [data-baseweb="tab-list"] {{
     gap: 0;
-    border-bottom: 1px solid #2A2A38;
+    border-bottom: 1px solid {_C["border"]};
     background: transparent;
-}
-[data-testid="stTabs"] [data-baseweb="tab"] {
+}}
+[data-testid="stTabs"] [data-baseweb="tab"] {{
     font-size: 0.78rem;
     letter-spacing: 0.12em;
     text-transform: uppercase;
     font-weight: 500;
-    color: #8A8898;
+    color: {_C["muted"]};
     padding: 0.8rem 1.4rem;
     border-bottom: 2px solid transparent;
     background: transparent;
-}
-[data-testid="stTabs"] [aria-selected="true"] {
-    color: #C2A87A !important;
-    border-bottom: 2px solid #C2A87A !important;
+}}
+[data-testid="stTabs"] [aria-selected="true"] {{
+    color: {_C["_tab_active"]} !important;
+    border-bottom: 2px solid {_C["_tab_active"]} !important;
     background: transparent !important;
-}
+}}
 
 /* Sidebar */
-[data-testid="stSidebar"] {
-    background: #0F0F14;
-    border-right: 1px solid #2A2A38;
-}
-[data-testid="stSidebar"] .block-container {
+[data-testid="stSidebar"] {{
+    background: {_C["_sidebar"]};
+    border-right: 1px solid {_C["border"]};
+}}
+[data-testid="stSidebar"] .block-container {{
     padding-top: 2rem;
-}
+}}
 
 /* Botones */
-.stButton > button {
+.stButton > button {{
     border-radius: 1px;
     font-weight: 500;
     letter-spacing: 0.08em;
     text-transform: uppercase;
     font-size: 0.75rem;
-    border: 1px solid #2A2A38;
+    border: 1px solid {_C["border"]};
+    color: {_C["text"]};
+    background: transparent;
     transition: all 0.2s ease;
-}
-.stButton > button[kind="primary"] {
-    background: #C2A87A;
-    border-color: #C2A87A;
-    color: #0C0C10;
-}
-.stButton > button[kind="primary"]:hover {
-    background: #D4BC94;
-    border-color: #D4BC94;
-}
-.stButton > button:hover {
-    border-color: #C2A87A;
-    color: #C2A87A;
-}
+}}
+.stButton > button[kind="primary"] {{
+    background: {_C["gold"]};
+    border-color: {_C["gold"]};
+    color: {_C["_bg"]};
+}}
+.stButton > button[kind="primary"]:hover {{
+    opacity: 0.85;
+}}
+.stButton > button:hover {{
+    border-color: {_C["gold"]};
+    color: {_C["gold"]};
+}}
 
 /* Dividers */
-hr {
-    border-color: #2A2A38 !important;
+hr {{
+    border-color: {_C["border"]} !important;
     margin: 1.5rem 0 !important;
-}
+}}
 
 /* Cabeceras */
-h1 {
+h1 {{
     font-weight: 300 !important;
     letter-spacing: 0.05em !important;
     font-size: 1.6rem !important;
-    color: #E8E4DC !important;
-}
-h2 {
+    color: {_C["text"]} !important;
+}}
+h2 {{
     font-weight: 400 !important;
     letter-spacing: 0.04em !important;
     font-size: 1.1rem !important;
-    color: #C2A87A !important;
+    color: {_C["_h2"]} !important;
     text-transform: uppercase;
     margin-top: 2rem !important;
-}
-h3 {
+}}
+h3 {{
     font-weight: 400 !important;
     font-size: 0.95rem !important;
-    color: #E8E4DC !important;
-}
+    color: {_C["_h3"]} !important;
+}}
 
 /* Captions / timestamp */
-.ts-label {
+.ts-label {{
     font-size: 0.72rem;
     letter-spacing: 0.08em;
-    color: #8A8898;
+    color: {_C["muted"]};
     text-transform: uppercase;
     margin-bottom: 1.5rem;
     display: block;
-}
+}}
 
 /* Badges */
-.badge-ok {
+.badge-ok {{
     display: inline-block;
-    background: rgba(78,158,138,0.15);
-    border: 1px solid rgba(78,158,138,0.4);
-    color: #4E9E8A;
+    background: {_C["teal_dim"]};
+    border: 1px solid {_C["teal"]};
+    color: {_C["teal"]};
     font-size: 0.7rem;
     letter-spacing: 0.1em;
     text-transform: uppercase;
     padding: 0.2rem 0.7rem;
     border-radius: 1px;
     font-weight: 500;
-}
-.badge-warn {
+}}
+.badge-warn {{
     display: inline-block;
-    background: rgba(196,147,106,0.15);
-    border: 1px solid rgba(196,147,106,0.4);
-    color: #C4936A;
+    background: {_C["gold_dim"]};
+    border: 1px solid {_C["amber"]};
+    color: {_C["amber"]};
     font-size: 0.7rem;
     letter-spacing: 0.1em;
     text-transform: uppercase;
     padding: 0.2rem 0.7rem;
     border-radius: 1px;
     font-weight: 500;
-}
-.badge-danger {
+}}
+.badge-danger {{
     display: inline-block;
-    background: rgba(176,92,92,0.15);
-    border: 1px solid rgba(176,92,92,0.4);
-    color: #B05C5C;
+    background: rgba(176,92,92,0.12);
+    border: 1px solid {_C["red"]};
+    color: {_C["red"]};
     font-size: 0.7rem;
     letter-spacing: 0.1em;
     text-transform: uppercase;
     padding: 0.2rem 0.7rem;
     border-radius: 1px;
     font-weight: 500;
-}
+}}
 
 /* Alertas personalizadas */
-.alerta-box {
-    background: #16161E;
-    border: 1px solid #2A2A38;
-    border-left: 3px solid #C2A87A;
+.alerta-box {{
+    background: {_C["surface"]};
+    border: 1px solid {_C["border"]};
+    border-left: 3px solid {_C["gold"]};
     border-radius: 2px;
     padding: 1rem 1.4rem;
     margin-bottom: 1rem;
     font-size: 0.88rem;
-    color: #E8E4DC;
+    color: {_C["text"]};
     line-height: 1.6;
-}
-.alerta-box-danger {
-    border-left-color: #B05C5C;
-}
-.alerta-box-success {
-    border-left-color: #4E9E8A;
-}
-.alerta-titulo {
+}}
+.alerta-box-danger {{
+    border-left-color: {_C["red"]};
+}}
+.alerta-box-success {{
+    border-left-color: {_C["teal"]};
+}}
+.alerta-titulo {{
     font-size: 0.72rem;
     letter-spacing: 0.12em;
     text-transform: uppercase;
-    color: #C2A87A;
+    color: {_C["gold"]};
     font-weight: 600;
     margin-bottom: 0.4rem;
     display: block;
-}
-.alerta-titulo-danger {
-    color: #B05C5C;
-}
-.alerta-titulo-success {
-    color: #4E9E8A;
-}
+}}
+.alerta-titulo-danger {{
+    color: {_C["red"]};
+}}
+.alerta-titulo-success {{
+    color: {_C["teal"]};
+}}
 
 /* Tabla de datos */
-[data-testid="stDataFrame"] {
-    border: 1px solid #2A2A38;
+[data-testid="stDataFrame"] {{
+    border: 1px solid {_C["border"]};
     border-radius: 2px;
-}
+}}
 
 /* Selectbox */
-[data-testid="stSelectbox"] label {
+[data-testid="stSelectbox"] label {{
     font-size: 0.75rem;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: #8A8898;
-}
+    color: {_C["muted"]};
+}}
 
 /* File uploader */
-[data-testid="stFileUploader"] label {
+[data-testid="stFileUploader"] label {{
     font-size: 0.75rem;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: #8A8898;
-}
+    color: {_C["muted"]};
+}}
 
 /* Expander */
-[data-testid="stExpander"] {
-    border: 1px solid #2A2A38 !important;
+[data-testid="stExpander"] {{
+    border: 1px solid {_C["border"]} !important;
     border-radius: 2px !important;
-    background: #16161E !important;
-}
+    background: {_C["surface"]} !important;
+}}
+
+/* Selectbox / input backgrounds en modo claro */
+[data-baseweb="select"] div,
+[data-baseweb="input"] input {{
+    background: {_C["surface"]} !important;
+    color: {_C["text"]} !important;
+    border-color: {_C["border"]} !important;
+}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -487,8 +542,16 @@ with st.sidebar:
                 st.error(f"Error: {e}")
 
     st.divider()
+
+    # ── Toggle de tema ────────────────────────────────────────────────────────
+    icono_tema  = "Fondo claro" if ES_OSCURO else "Fondo oscuro"
+    if st.button(icono_tema, use_container_width=True, key="btn_tema"):
+        st.session_state.tema = "light" if ES_OSCURO else "dark"
+        st.rerun()
+
+    st.divider()
     st.markdown(
-        '<span style="font-size:0.68rem;color:#8A8898;">'
+        f'<span style="font-size:0.68rem;color:{COLORS["muted"]};">'
         'v5.0 — Proyecto de titulacion Ibero 2026<br>'
         'Modelos: SARIMA · Prophet · Random Forest'
         '</span>',
